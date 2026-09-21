@@ -17,10 +17,12 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text
 # Reusa o MESMO padrao BiDi do whatsapp-collector.ps1 (Firefox, porta 9224).
 # NAO modifica o collector. Roda DEPOIS dele, com o Firefox ainda no WhatsApp Web.
 #
-# Risco conhecido: o WhatsApp Web carrega audio de forma preguicosa; o <audio>.src
-# (blob:) so aparece depois do play. Mitigacao: clique confiavel no play + espera;
-# audio que nao expoe blob e logado e pulado (o transcritor tem fallback manual:
-# arrastar OGGs para audio-inbox\ tambem funciona).
+# Extracao silenciosa: Setup-SilentPlay hookea HTMLAudioElement.prototype.play
+# para silenciar antes de chamar o original. O WhatsApp ainda baixa e descriptografa
+# o audio (o CDN usa E2E — rede nao serve), o Setup-BlobCapture captura o blob
+# resultante, e nos buscamos os bytes. Nao sai som pelas caixas/fone.
+# Fallback: se o hook nao instalar, o fluxo de clique continua normalmente
+# (audio pode tocar, mas a extracao ainda funciona).
 # Tudo local.
 # ============================================================
 
@@ -381,6 +383,26 @@ function Find-Audios {
     return @($rows)
 }
 
+function Setup-SilentPlay {
+    # Hookea HTMLAudioElement.prototype.play para silenciar ANTES de chamar o original.
+    # O WhatsApp ainda baixa + descriptografa o audio (necessario para o blob ser criado);
+    # apenas nao toca pelas caixas/fone. Idempotente. Fallback: se falhar, segue com som.
+    try {
+        JS @'
+(() => {
+  if (window._waSilentInstalled) return "already";
+  window._waSilentInstalled = true;
+  const orig = HTMLAudioElement.prototype.play;
+  HTMLAudioElement.prototype.play = function() {
+    try { this.muted = true; this.volume = 0; } catch(e) {}
+    return orig.call(this);
+  };
+  return "installed";
+})()
+'@ 8 | Out-Null
+    } catch { Log "AVISO: Setup-SilentPlay falhou (audio pode tocar); seguindo." DarkYellow }
+}
+
 # Instala interceptor de URL.createObjectURL para capturar blob de audio.
 # Idempotente: checa window._waBlobCapInstalled antes de instalar.
 # O blob URL capturado fica em window._waBlobUrl (string) ou null.
@@ -472,6 +494,7 @@ Write-Host "============================================" -ForegroundColor Cyan
 try {
     Connect-Bidi
     Wait-Ready
+    Setup-SilentPlay
     Setup-BlobCapture
     Reset-SidebarTop
 
