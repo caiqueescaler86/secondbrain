@@ -1,0 +1,17 @@
+# Dados pessoais e sensíveis — nunca commitar
+WhatsApp/
+Meetings/
+raw/
+processed/
+logs/
+lib/
+
+# Arquivos temporários e de estado
+null
+*.wav
+*.ogg
+*.mp3
+*.jsonl
+
+# Credenciais/configs locais
+ET-Joule_commandline.txt

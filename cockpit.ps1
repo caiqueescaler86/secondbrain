@@ -1,0 +1,231 @@
+param(
+    [int]$Port = 8787,
+    [switch]$Open
+)
+
+$ErrorActionPreference = "Stop"
+
+try {
+    [Console]::OutputEncoding = [Text.Encoding]::UTF8
+    $OutputEncoding = [Text.Encoding]::UTF8
+} catch {}
+
+# ============================================================
+# SECONDBRAIN - COCKPIT (servidor web local)
+#
+# HttpListener em http://127.0.0.1:<Port>/ servindo a SPA e uma
+# mini-API sobre processed\tasks.json. 100% local, loopback.
+# ============================================================
+
+$Root      = Split-Path -Parent $MyInvocation.MyCommand.Path
+$WebDir    = Join-Path $Root "cockpit"
+$Processed = Join-Path $Root "processed"
+$TasksFile = Join-Path $Processed "tasks.json"
+
+if (-not (Test-Path $Processed)) { New-Item -ItemType Directory -Path $Processed -Force | Out-Null }
+
+# UTF-8 sem BOM: evita que ferramentas externas (json.load, etc.) tropecem
+# no BOM no inicio do arquivo.
+$script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+if (-not (Test-Path $TasksFile)) { [System.IO.File]::WriteAllText($TasksFile, "[]", $script:Utf8NoBom) }
+
+# --- lock simples para leitura/escrita coerente do store --------------------
+$script:StoreLock = [System.Object]::new()
+
+function Read-Tasks {
+    [System.Threading.Monitor]::Enter($script:StoreLock)
+    try {
+        $raw = [System.IO.File]::ReadAllText($TasksFile, [Text.Encoding]::UTF8)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
+        $parsed = $raw | ConvertFrom-Json
+        return @($parsed)
+    }
+    catch { return @() }
+    finally { [System.Threading.Monitor]::Exit($script:StoreLock) }
+}
+
+function Write-Tasks($tasks) {
+    # Escrita atomica: grava em temp e move por cima (nao corrompe se cair).
+    [System.Threading.Monitor]::Enter($script:StoreLock)
+    try {
+        $json = @($tasks) | ConvertTo-Json -Depth 20
+        if ([string]::IsNullOrWhiteSpace($json)) { $json = "[]" }
+        if ($json -notmatch '^\s*\[') { $json = "[$json]" }
+        $tmp = "$TasksFile.tmp"
+        [System.IO.File]::WriteAllText($tmp, $json, $script:Utf8NoBom)
+        [System.IO.File]::Copy($tmp, $TasksFile, $true)
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+    finally { [System.Threading.Monitor]::Exit($script:StoreLock) }
+}
+
+function Rollover-Tasks($tasks) {
+    # Vencidas e abertas -> dueDate = hoje. Retorna $true se mudou algo.
+    $today = (Get-Date).ToString("yyyy-MM-dd")
+    $changed = $false
+    foreach ($t in $tasks) {
+        if (-not $t.done -and $t.dueDate -and ([string]$t.dueDate) -lt $today) {
+            $t.dueDate = $today
+            if ($t.PSObject.Properties.Name -contains "updatedAt") {
+                $t.updatedAt = (Get-Date).ToString("o")
+            }
+            $changed = $true
+        }
+    }
+    return $changed
+}
+
+# --- MIME + estaticos --------------------------------------------------------
+function Get-Mime($path) {
+    switch ([IO.Path]::GetExtension($path).ToLower()) {
+        ".html" { "text/html; charset=utf-8" }
+        ".css"  { "text/css; charset=utf-8" }
+        ".js"   { "application/javascript; charset=utf-8" }
+        ".json" { "application/json; charset=utf-8" }
+        ".svg"  { "image/svg+xml" }
+        ".ico"  { "image/x-icon" }
+        default { "application/octet-stream" }
+    }
+}
+
+function Send-Bytes($ctx, [int]$status, [byte[]]$bytes, [string]$contentType) {
+    $ctx.Response.StatusCode = $status
+    $ctx.Response.ContentType = $contentType
+    $ctx.Response.Headers["Cache-Control"] = "no-store"
+    $ctx.Response.ContentLength64 = $bytes.Length
+    $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+    $ctx.Response.OutputStream.Close()
+}
+
+function Send-Text($ctx, [int]$status, [string]$text, [string]$contentType = "text/plain; charset=utf-8") {
+    Send-Bytes $ctx $status ([Text.Encoding]::UTF8.GetBytes($text)) $contentType
+}
+
+function Send-Json($ctx, [int]$status, $obj) {
+    $json = $obj | ConvertTo-Json -Depth 20
+    if ($null -eq $obj -or [string]::IsNullOrWhiteSpace($json)) { $json = "[]" }
+    if (($obj -is [array]) -and ($json -notmatch '^\s*\[')) { $json = "[$json]" }
+    Send-Text $ctx $status $json "application/json; charset=utf-8"
+}
+
+function Serve-Static($ctx, [string]$relPath) {
+    if ([string]::IsNullOrWhiteSpace($relPath) -or $relPath -eq "/") { $relPath = "index.html" }
+    $relPath = $relPath.TrimStart("/")
+    $full = Join-Path $WebDir $relPath
+    # Impede path traversal fora de cockpit\.
+    $fullResolved = [IO.Path]::GetFullPath($full)
+    if (-not $fullResolved.StartsWith([IO.Path]::GetFullPath($WebDir))) {
+        Send-Text $ctx 403 "Forbidden"; return
+    }
+    if (-not (Test-Path $fullResolved)) { Send-Text $ctx 404 "Not found: $relPath"; return }
+    $bytes = [System.IO.File]::ReadAllBytes($fullResolved)
+    Send-Bytes $ctx 200 $bytes (Get-Mime $fullResolved)
+}
+
+# --- API ---------------------------------------------------------------------
+function Handle-GetTasks($ctx) {
+    $tasks = Read-Tasks
+    if (Rollover-Tasks $tasks) { Write-Tasks $tasks }
+    Send-Json $ctx 200 @($tasks)
+}
+
+function Handle-PostTask($ctx, [string]$sbid) {
+    $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [Text.Encoding]::UTF8)
+    $body = $reader.ReadToEnd()
+    $reader.Close()
+
+    $patch = $null
+    try { $patch = $body | ConvertFrom-Json } catch { Send-Json $ctx 400 @{ error = "JSON invalido" }; return }
+
+    $tasks = Read-Tasks
+    $task = $tasks | Where-Object { $_.sbid -eq $sbid } | Select-Object -First 1
+    if (-not $task) { Send-Json $ctx 404 @{ error = "sbid nao encontrado" }; return }
+
+    $allowed = @("done", "snoozedUntil", "prioridade", "notas", "status", "dueDate")
+    $history = @()
+    foreach ($name in $patch.PSObject.Properties.Name) {
+        if ($allowed -notcontains $name) { continue }
+        $newVal = $patch.$name
+        if ($task.PSObject.Properties.Name -contains $name) {
+            $old = $task.$name
+            $task.$name = $newVal
+        }
+        else {
+            $task | Add-Member -NotePropertyName $name -NotePropertyValue $newVal -Force
+            $old = $null
+        }
+        $history += "${name}: '$old' -> '$newVal'"
+    }
+
+    # Marca que o usuario tocou (o orquestrador preserva isso no merge).
+    $touched = (Get-Date).ToString("o")
+    if ($task.PSObject.Properties.Name -contains "updatedAt") { $task.updatedAt = $touched }
+    else { $task | Add-Member -NotePropertyName "updatedAt" -NotePropertyValue $touched -Force }
+    if ($task.PSObject.Properties.Name -contains "userTouched") { $task.userTouched = $touched }
+    else { $task | Add-Member -NotePropertyName "userTouched" -NotePropertyValue $touched -Force }
+
+    if ($task.PSObject.Properties.Name -notcontains "history") {
+        $task | Add-Member -NotePropertyName "history" -NotePropertyValue @() -Force
+    }
+    $task.history = @($task.history) + @("[$touched] " + ($history -join "; "))
+
+    Write-Tasks $tasks
+    Send-Json $ctx 200 $task
+}
+
+# --- servidor ----------------------------------------------------------------
+$prefix = "http://127.0.0.1:$Port/"
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add($prefix)
+
+try {
+    $listener.Start()
+}
+catch {
+    Write-Host ""
+    Write-Host "Nao consegui abrir $prefix" -ForegroundColor Red
+    Write-Host "Se for 'Access denied', rode UMA vez (como admin):" -ForegroundColor Yellow
+    Write-Host "  netsh http add urlacl url=$prefix user=$env:USERNAME" -ForegroundColor Yellow
+    throw
+}
+
+Write-Host ""
+Write-Host "  SECONDBRAIN COCKPIT" -ForegroundColor Cyan
+Write-Host "  $prefix" -ForegroundColor Green
+Write-Host "  store: $TasksFile" -ForegroundColor DarkGray
+Write-Host "  Ctrl+C para parar." -ForegroundColor DarkGray
+Write-Host ""
+
+if ($Open) { Start-Process $prefix }
+
+try {
+    while ($listener.IsListening) {
+        $ctx = $listener.GetContext()
+        try {
+            $method = $ctx.Request.HttpMethod
+            $path = $ctx.Request.Url.AbsolutePath
+
+            if ($method -eq "GET" -and $path -eq "/api/tasks") {
+                Handle-GetTasks $ctx
+            }
+            elseif ($method -eq "POST" -and $path -like "/api/task/*") {
+                $sbid = [System.Uri]::UnescapeDataString($path.Substring("/api/task/".Length))
+                Handle-PostTask $ctx $sbid
+            }
+            elseif ($method -eq "GET") {
+                Serve-Static $ctx $path
+            }
+            else {
+                Send-Text $ctx 405 "Method not allowed"
+            }
+        }
+        catch {
+            try { Send-Text $ctx 500 ("Erro: " + $_.Exception.Message) } catch {}
+        }
+    }
+}
+finally {
+    $listener.Stop()
+    $listener.Close()
+}

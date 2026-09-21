@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SecondBrain · Cockpit</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="scanline"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◇</span>
+      <div class="brand-txt">
+        <div class="brand-name">SECOND<span>BRAIN</span></div>
+        <div class="brand-sub">cockpit local · 127.0.0.1</div>
+      </div>
+    </div>
+
+    <div class="clock">
+      <div id="clock-time">--:--</div>
+      <div id="clock-date">—</div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><span id="stat-hoje">0</span><label>hoje</label></div>
+      <div class="stat danger"><span id="stat-atrasadas">0</span><label>atrasadas</label></div>
+      <div class="stat"><span id="stat-aguardando">0</span><label>aguardando</label></div>
+      <div class="stat muted"><span id="stat-total">0</span><label>abertas</label></div>
+    </div>
+
+    <div class="controls">
+      <input id="search" type="text" placeholder="buscar pessoa, assunto…" autocomplete="off" />
+      <label class="toggle"><input type="checkbox" id="show-ref" /> <span>referência / baixa</span></label>
+      <label class="toggle"><input type="checkbox" id="show-done" /> <span>concluídas</span></label>
+      <button id="refresh" title="Recarregar">⟳</button>
+    </div>
+  </header>
+
+  <main id="board" class="board">
+    <div class="empty" id="empty-state">
+      <div class="empty-glyph">◇</div>
+      <p>Nenhuma tarefa carregada.</p>
+      <small>Rode <code>secondbrain-run.ps1 -OpenCockpit</code> para popular a fila.</small>
+    </div>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
