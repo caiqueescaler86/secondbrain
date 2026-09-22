@@ -20,7 +20,7 @@ const PREFIX = {
   aguardando: "Aguardando", preparar: "Preparar", risco: "Risco", referencia: "Ref",
 };
 
-let STATE = { tasks: [], search: "", showRef: false, showDone: false };
+let STATE = { tasks: [], search: "", showRef: false, showDone: false, open: new Set() };
 
 // ---------- helpers ----------
 const $ = (s, r = document) => r.querySelector(s);
@@ -210,6 +210,7 @@ function render() {
 function renderCard(task) {
   const card = el("div", "card prio-" + (task.prioridade || "media"));
   if (task.done) card.classList.add("done");
+  if (STATE.open.has(task.sbid)) card.classList.add("open");
 
   const top = el("div", "card-top");
   // Concluir em 1 clique, sem precisar expandir o card (parte externa).
@@ -279,7 +280,10 @@ function renderCard(task) {
   detail.appendChild(actions);
   card.appendChild(detail);
 
-  card.addEventListener("click", () => card.classList.toggle("open"));
+  card.addEventListener("click", () => {
+    const isOpen = card.classList.toggle("open");
+    if (isOpen) STATE.open.add(task.sbid); else STATE.open.delete(task.sbid);
+  });
   return card;
 }
 
@@ -535,4 +539,15 @@ tickClock();
 setInterval(tickClock, 10000);
 setAgentTarget(AGENT.target); // sincroniza toggle/placeholder com o alvo padrao (Joule)
 load();
-setInterval(load, 60000); // auto-refresh 1 min
+
+// auto-refresh 1 min — mas NAO enquanto o usuario mexe: se ha um campo em foco
+// (digitando notas, prazo, busca, modal, agente) o render() fecharia o card aberto
+// e descartaria texto ainda nao salvo. Nesses casos pula o tick.
+function autoRefresh() {
+  const a = document.activeElement;
+  if (a && /^(TEXTAREA|INPUT|SELECT)$/.test(a.tagName)) return;
+  if (!$("#modal-backdrop").hidden) return;
+  if (AGENT.open || AGENT.busy) return;
+  load();
+}
+setInterval(autoRefresh, 60000);
