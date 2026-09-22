@@ -12,8 +12,23 @@ function Enable-CopilotDebug {
     $key =
         "HKCU:\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments"
 
-    # Em maquina gerenciada (enterprise) essa chave de policy pode estar
-    # bloqueada. Se ja houver porta CDP ativa, nao precisamos escrever nada.
+    # A chave so eh LIDA pelo WebView2 quando o M365Copilot INICIA. Em maquina
+    # gerenciada (enterprise) a policy fica read-only (GPO): reescrever lanca
+    # "Requested registry access is not allowed". Mas se a chave JA tem a porta
+    # certa, nao precisamos escrever nada - basta relancar o app que ele sobe
+    # com o CDP ligado. So falhamos se a chave NAO estiver correta E nao der
+    # para escrever E nao houver porta ativa.
+    $expected = "--remote-debugging-port=$global:CopilotPort"
+
+    $current = $null
+    try {
+        $current = (Get-ItemProperty -Path $key -Name "M365Copilot.exe" -ErrorAction Stop)."M365Copilot.exe"
+    } catch {}
+
+    if ($current -and ($current -match [regex]::Escape($expected))) {
+        return   # ja configurada: relancar o app basta.
+    }
+
     try {
         New-Item -Path $key -Force -ErrorAction Stop | Out-Null
 
@@ -46,15 +61,33 @@ function Test-CopilotCDP {
     }
 }
 
+function Test-CopilotSuspended {
+    # Retorna $true se o unico target disponivel tem appstate=suspended na URL.
+    # Nesse estado o WebView esta congelado: a porta CDP responde mas o JS nao roda.
+    try {
+        $content = (Invoke-WebRequest "http://127.0.0.1:$global:CopilotPort/json/list" -UseBasicParsing -TimeoutSec 3).Content
+        $targets = ConvertFrom-Json -InputObject $content
+        $pages = @($targets | Where-Object { $_.type -eq "page" -and $_.title -like "*Copilot*" })
+        if ($pages.Count -eq 0) { return $true }   # sem page = suspenso / nao carregado
+        foreach ($p in $pages) {
+            if ($p.url -notmatch 'appstate=suspended') { return $false }
+        }
+        return $true   # todos suspensos
+    } catch { return $true }
+}
+
 function Start-CopilotBridge {
     Enable-CopilotDebug
 
-    if (Test-CopilotCDP) {
+    # Porta CDP aberta NAO garante que o app esta ativo: o M365Copilot pode estar
+    # suspenso (appstate=suspended na URL do target), caso em que o WebView congela
+    # e qualquer tentativa de interacao falha silenciosamente. Precisa relançar.
+    if (Test-CopilotCDP -and -not (Test-CopilotSuspended)) {
         return
     }
 
+    # Suspenso ou sem porta: mata e relanca.
     $running = Get-Process M365Copilot -ErrorAction SilentlyContinue
-
     if ($running) {
         $running | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
@@ -62,17 +95,17 @@ function Start-CopilotBridge {
 
     Start-Process $global:CopilotApp
 
-    $deadline = (Get-Date).AddSeconds(30)
+    $deadline = (Get-Date).AddSeconds(40)
 
     do {
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 600
 
-        if (Test-CopilotCDP) {
+        if (Test-CopilotCDP -and -not (Test-CopilotSuspended)) {
             return
         }
     } while ((Get-Date) -lt $deadline)
 
-    throw "Copilot abriu, mas a porta CDP $global:CopilotPort nao apareceu."
+    throw "Copilot abriu, mas a porta CDP $global:CopilotPort nao ficou ativa (nao-suspensa)."
 }
 
 function Get-CopilotTargets {
@@ -113,51 +146,68 @@ $script:CdpId = 0
 function Open-CopilotSession {
     param([int]$TimeoutSec = 180)
 
-    $targets = @(Get-CopilotTargets)
+    # Cold-start / pos-relaunch o app passa por about:blank -> "Microsoft Copilot"
+    # -> chat pronto (editor presente). Em vez de uma tentativa unica, repetimos
+    # a busca do renderer com editor por ate ~45s, absorvendo essa transicao.
+    $deadline = (Get-Date).AddSeconds(45)
 
-    if ($targets.Count -eq 0) {
-        throw "Nenhum renderer do Copilot encontrado."
-    }
+    do {
+        $targets = @(Get-CopilotTargets)
 
-    foreach ($target in $targets) {
-        $ws = [System.Net.WebSockets.ClientWebSocket]::new()
-        $cts = [System.Threading.CancellationTokenSource]::new()
-        $cts.CancelAfter([TimeSpan]::FromSeconds($TimeoutSec))
+        foreach ($target in $targets) {
+            $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+            $cts = [System.Threading.CancellationTokenSource]::new()
+            $cts.CancelAfter([TimeSpan]::FromSeconds($TimeoutSec))
 
-        try {
-            $url = [string]$target.webSocketDebuggerUrl
-            $ws.ConnectAsync([Uri]$url, $cts.Token).GetAwaiter().GetResult() | Out-Null
+            try {
+                $url = [string]$target.webSocketDebuggerUrl
+                $ws.ConnectAsync([Uri]$url, $cts.Token).GetAwaiter().GetResult() | Out-Null
 
-            if ($ws.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
-                throw "socket nao abriu"
+                if ($ws.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                    throw "socket nao abriu"
+                }
+
+                $script:CdpWs = $ws
+                $script:CdpCts = $cts
+
+                # So aceita o renderer que realmente tem o editor do Copilot.
+                $hasEditor = Send-CDP "Runtime.evaluate" @{
+                    returnByValue = $true
+                    expression = '(()=>!!(document.querySelector(''[contenteditable="true"][aria-label="Message Copilot"]'')||document.querySelector(''[contenteditable="true"]'')))()'
+                }
+
+                if ($hasEditor) {
+                    # Mantem o renderer "ativo/focado" para o WebView2 nao
+                    # estrangular timers nem virtualizar/colapsar a resposta
+                    # quando a janela fica em segundo plano. Essa e a CAUSA RAIZ
+                    # do timeout: com a janela atras, o node da resposta some do
+                    # DOM e readLast() lia "" a rodada inteira -> timeout sem
+                    # texto. setFocusEmulationEnabled faz document.hasFocus()==true
+                    # e desliga o throttle de background. Best-effort (dominios
+                    # podem faltar): qualquer erro aqui e ignorado.
+                    try { Send-CDP "Emulation.setFocusEmulationEnabled" @{ enabled = $true } | Out-Null } catch {}
+                    try { Send-CDP "Page.enable" @{} | Out-Null } catch {}
+                    try { Send-CDP "Page.setWebLifecycleState" @{ state = "active" } | Out-Null } catch {}
+                    return
+                }
+
+                # Renderer errado / chat ainda carregando: fecha e tenta o proximo.
+                try { $ws.Dispose() } catch {}
+                try { $cts.Dispose() } catch {}
+                $script:CdpWs = $null
+                $script:CdpCts = $null
             }
-
-            $script:CdpWs = $ws
-            $script:CdpCts = $cts
-
-            # So aceita o renderer que realmente tem o editor do Copilot.
-            $hasEditor = Send-CDP "Runtime.evaluate" @{
-                returnByValue = $true
-                expression = '(()=>!!(document.querySelector(''[contenteditable="true"][aria-label="Message Copilot"]'')||document.querySelector(''[contenteditable="true"]'')))()'
+            catch {
+                try { $ws.Dispose() } catch {}
+                try { $cts.Dispose() } catch {}
+                $script:CdpWs = $null
+                $script:CdpCts = $null
             }
-
-            if ($hasEditor) {
-                return
-            }
-
-            # Renderer errado: fecha e tenta o proximo.
-            try { $ws.Dispose() } catch {}
-            try { $cts.Dispose() } catch {}
-            $script:CdpWs = $null
-            $script:CdpCts = $null
         }
-        catch {
-            try { $ws.Dispose() } catch {}
-            try { $cts.Dispose() } catch {}
-            $script:CdpWs = $null
-            $script:CdpCts = $null
-        }
-    }
+
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Milliseconds 800
+    } while ($true)
 
     throw "Nenhum renderer ativo do Copilot com editor respondeu."
 }
@@ -349,7 +399,8 @@ function Ask-Copilot {
   const r = e.getBoundingClientRect();
   const replies = [...document.querySelectorAll('[data-testid="markdown-reply"]')];
   const ids = replies.map(el => el.getAttribute("data-message-id")).filter(Boolean);
-  return JSON.stringify({ok:true, count:replies.length, ids, x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2)});
+  const copyCount = document.querySelectorAll('[data-testid="CopyButtonTestId"]').length;
+  return JSON.stringify({ok:true, count:replies.length, ids, copyCount, x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2)});
 })()
 '@
         }
@@ -384,16 +435,78 @@ function Ask-Copilot {
             throw "Nao consegui inserir o texto no editor do Copilot."
         }
 
-        # 6) Envia com Enter (keyDown + keyUp).
-        Send-CDP "Input.dispatchKeyEvent" @{ type="keyDown"; key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
-        Send-CDP "Input.dispatchKeyEvent" @{ type="keyUp";   key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
+        # 6) Envia. No chat recem-carregado (pos-relaunch) o handler de Enter as
+        # vezes ainda nao esta pronto e a mensagem fica digitada sem enviar. O
+        # clique REAL no botao Send (aria-label="Send") e confiavel; Enter fica
+        # como fallback se o botao nao aparecer.
+        $sendBtn = Send-CDP "Runtime.evaluate" @{
+            returnByValue = $true
+            expression = @'
+(() => {
+  const b = document.querySelector('button[aria-label="Send"]') || document.querySelector('button[aria-label="Enviar"]');
+  if (!b || b.disabled) return JSON.stringify({ok:false});
+  const r = b.getBoundingClientRect();
+  return JSON.stringify({ok:true, x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2)});
+})()
+'@
+        }
+        $sb = $null
+        try { $sb = $sendBtn | ConvertFrom-Json } catch {}
 
-        # 7) Aguarda a resposta nova estabilizar (poll dentro do renderer).
-        $existingJson = ($p.ids | ConvertTo-Json -Compress)
-        if ([string]::IsNullOrWhiteSpace($existingJson)) { $existingJson = "[]" }
-        # ConvertTo-Json de um unico item nao gera array; forca colchetes.
-        if ($existingJson -notmatch '^\s*\[') { $existingJson = "[$existingJson]" }
-        $existingCount = [int]$p.count
+        if ($sb -and $sb.ok) {
+            Send-CDP "Input.dispatchMouseEvent" @{ type="mousePressed";  x=[int]$sb.x; y=[int]$sb.y; button="left"; clickCount=1 } | Out-Null
+            Send-CDP "Input.dispatchMouseEvent" @{ type="mouseReleased"; x=[int]$sb.x; y=[int]$sb.y; button="left"; clickCount=1 } | Out-Null
+        } else {
+            Send-CDP "Input.dispatchKeyEvent" @{ type="keyDown"; key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
+            Send-CDP "Input.dispatchKeyEvent" @{ type="keyUp";   key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
+        }
+
+        # 6b) Confirma que a GERACAO COMECOU (botao Stop aparece). Se em ~10s nao
+        # apareceu, o Send nao pegou (editor ainda com texto): reenvia UMA vez
+        # (clique no Send de novo, senao Enter). Isso mata o modo de falha em que
+        # o texto ficava digitado e a rodada dava timeout sem resposta nenhuma.
+        $genStarted = $false
+        $startDeadline = (Get-Date).AddSeconds(10)
+        do {
+            Start-Sleep -Milliseconds 400
+            $genStarted = [bool](Send-CDP "Runtime.evaluate" @{
+                returnByValue = $true
+                expression = '(()=>!!(document.querySelector(''button[aria-label="Stop"]'')||document.querySelector(''button[aria-label="Stop generating"]'')||document.querySelector(''button[aria-label="Parar"]'')))()'
+            })
+        } while (-not $genStarted -and (Get-Date) -lt $startDeadline)
+
+        if (-not $genStarted) {
+            # Reenvio: acha o Send de novo e clica; fallback Enter.
+            $sendBtn2 = Send-CDP "Runtime.evaluate" @{
+                returnByValue = $true
+                expression = @'
+(() => {
+  const b = document.querySelector('button[aria-label="Send"]') || document.querySelector('button[aria-label="Enviar"]');
+  if (!b || b.disabled) return JSON.stringify({ok:false});
+  const r = b.getBoundingClientRect();
+  return JSON.stringify({ok:true, x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2)});
+})()
+'@
+            }
+            $sb2 = $null
+            try { $sb2 = $sendBtn2 | ConvertFrom-Json } catch {}
+            if ($sb2 -and $sb2.ok) {
+                Send-CDP "Input.dispatchMouseEvent" @{ type="mousePressed";  x=[int]$sb2.x; y=[int]$sb2.y; button="left"; clickCount=1 } | Out-Null
+                Send-CDP "Input.dispatchMouseEvent" @{ type="mouseReleased"; x=[int]$sb2.x; y=[int]$sb2.y; button="left"; clickCount=1 } | Out-Null
+            } else {
+                Send-CDP "Input.dispatchKeyEvent" @{ type="keyDown"; key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
+                Send-CDP "Input.dispatchKeyEvent" @{ type="keyUp";   key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
+            }
+        }
+
+        # 7) Aguarda a RESPOSTA FINAL. Sinal robusto, independente de quantos steps
+        # o reasoning faz: o botao STOP existe DURANTE a geracao e SOME quando
+        # termina. (A contagem de toolbars Copy nao serve: o DOM virtualiza e
+        # colapsa as respostas -> o count fica preso em 1 e nunca "cresce".)
+        # Logica: (A) espera ver o Stop (geracao em curso); (B) espera o Stop
+        # sumir com texto presente = resposta final. Fallback: se nunca vimos o
+        # Stop (janela perdida), aceita quando surge uma toolbar Copy nova.
+        $existingCopyCount = [int]$p.copyCount
         $timeoutMs = $TimeoutSec * 1000
 
         $poll = Send-CDP "Runtime.evaluate" @{
@@ -401,48 +514,75 @@ function Ask-Copilot {
             returnByValue = $true
             expression = @"
 (async () => {
-    const existingIds = new Set($existingJson);
-    const existingCount = $existingCount;
+    const baseCopy = $existingCopyCount;
     const timeoutMs = $timeoutMs;
+
+    const stopVisible = () => !!(
+        document.querySelector('button[aria-label="Stop"]') ||
+        document.querySelector('button[aria-label="Stop generating"]') ||
+        document.querySelector('button[aria-label="Parar"]')
+    );
+    // Antes de ler, ROLA ate o fim para a lista virtualizada renderizar a cauda
+    // (senao o node da ultima resposta pode nao existir no DOM). Le o markdown
+    // padrao e, se sumiu, cai em seletores de resposta mais amplos.
+    const readLast = () => {
+        try { window.scrollTo(0, document.body.scrollHeight); } catch (e) {}
+        let replies = [...document.querySelectorAll('[data-testid="markdown-reply"]')];
+        if (!replies.length) {
+            replies = [...document.querySelectorAll('[data-testid*="markdown" i],[data-testid*="reply" i],[data-testid*="response" i]')];
+        }
+        if (!replies.length) return "";
+        const last = replies[replies.length - 1];
+        try { last.scrollIntoView({ block: "end" }); } catch (e) {}
+        return (last.innerText || last.textContent || "").replace(/\s+/g, " ").trim();
+    };
+    const editorLen = () => {
+        const e = document.querySelector('[contenteditable="true"][aria-label="Message Copilot"]') || document.querySelector('[contenteditable="true"]');
+        return e ? (e.innerText || "").trim().length : -1;
+    };
 
     return await new Promise(resolve => {
         const started = Date.now();
-        let lastText = "", lastId = null, stableSince = null;
+        let sawStop = false, lastText = "", doneText = "", stableSince = 0, recoverSince = null;
 
         const finish = value => { clearInterval(timer); resolve(value); };
 
         const timer = setInterval(() => {
-            const replies = [...document.querySelectorAll('[data-testid="markdown-reply"]')];
-            let candidate = null;
+            const stop = stopVisible();
+            const copy = document.querySelectorAll('[data-testid="CopyButtonTestId"]').length;
+            const text = readLast();
+            if (text) lastText = text;
+            if (stop) sawStop = true;
 
-            for (const reply of replies) {
-                const id = reply.getAttribute("data-message-id");
-                if (id && !existingIds.has(id)) { candidate = reply; }
-            }
-            if (!candidate && replies.length > existingCount) {
-                candidate = replies[replies.length - 1];
-            }
+            // A geracao TERMINOU quando: (A) vimos o Stop e ele sumiu; ou
+            // (B) fallback -- nunca vimos o Stop (janela perdida) mas surgiu uma
+            // toolbar Copy nova. NAO exige texto aqui: se a virtualizacao
+            // colapsou a resposta, entramos em recuperacao e insistimos no
+            // scroll/re-read ate o texto aparecer e estabilizar.
+            const genEnded =
+                (sawStop && !stop) ||
+                (!sawStop && copy > baseCopy);
 
-            if (candidate) {
-                const text = (candidate.innerText || candidate.textContent || "").replace(/\s+/g, " ").trim();
-                const id = candidate.getAttribute("data-message-id");
-                if (text && (text !== lastText || id !== lastId)) {
-                    lastText = text; lastId = id; stableSince = Date.now();
+            if (genEnded) {
+                if (recoverSince === null) recoverSince = Date.now();
+                if (text && text === doneText) {
+                    // texto estavel por 800ms = frame final -> conclui
+                    if (Date.now() - stableSince >= 800) { finish({ ok:true, text }); return; }
+                } else {
+                    doneText = text; stableSince = Date.now();
                 }
-                // Se a resposta parece um array JSON AINDA nao fechado (comeca com
-                // "[" mas nao terminou com "]"), o Copilot ainda esta gerando -> nao
-                // fecha cedo (era o caso do capturar so "["). "[]" ja fecha, ok.
-                const t = text || "";
-                const jsonOpenIncomplete = t.startsWith("[") && !t.endsWith("]");
-                if (text && !jsonOpenIncomplete && stableSince && (Date.now() - stableSince) >= 4000) {
-                    finish({ ok:true, text, messageId:id });
+                // Recuperacao esgotou (~6s insistindo): devolve o melhor texto
+                // que houver; so falha se NADA foi lido a rodada inteira.
+                if (Date.now() - recoverSince >= 6000) {
+                    if (lastText) finish({ ok:true, text:lastText, partial:true });
+                    else finish({ ok:false, error:"Timeout esperando resposta do Copilot.", diag:{ sawStop, mdReply:document.querySelectorAll('[data-testid="markdown-reply"]').length, copy, editorLen:editorLen(), elapsed:Math.round((Date.now()-started)/1000) } });
                     return;
                 }
             }
 
             if (Date.now() - started > timeoutMs) {
-                if (lastText) { finish({ ok:true, text:lastText, messageId:lastId, partial:true }); }
-                else { finish({ ok:false, error:"Timeout esperando resposta do Copilot." }); }
+                if (lastText) { finish({ ok:true, text:lastText, partial:true }); }
+                else { finish({ ok:false, error:"Timeout esperando resposta do Copilot.", diag:{ sawStop, mdReply:document.querySelectorAll('[data-testid="markdown-reply"]').length, copy, editorLen:editorLen(), elapsed:Math.round((Date.now()-started)/1000) } }); }
             }
         }, 250);
     });
@@ -454,7 +594,12 @@ function Ask-Copilot {
             throw "Copilot nao retornou resultado."
         }
         if (-not $poll.ok) {
-            throw $poll.error
+            $msg = [string]$poll.error
+            if ($poll.diag) {
+                $d = $poll.diag
+                $msg += " [diag: sawStop=$($d.sawStop) mdReply=$($d.mdReply) copy=$($d.copy) editorLen=$($d.editorLen) elapsed=$($d.elapsed)s]"
+            }
+            throw $msg
         }
 
         return $poll.text
@@ -502,6 +647,11 @@ function Start-CopilotTerminal {
         }
     }
 }
+
+# Permite carregar este arquivo como BIBLIOTECA (dot-source) sem executar nada:
+# `$env:COPILOT_LIB=1; . .\copilot-terminal.ps1` expoe as funcoes (Open-CopilotSession,
+# Send-CDP, Ask-Copilot, etc.) para outros scripts/diagnostico.
+if ($env:COPILOT_LIB -eq '1') { return }
 
 if (-not [string]::IsNullOrWhiteSpace($Prompt)) {
     try {

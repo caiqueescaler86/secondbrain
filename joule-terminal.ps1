@@ -1,8 +1,26 @@
 param(
     [string]$Prompt,
+    [string]$PromptFile,
     [switch]$NewThread,
     [int]$TimeoutSec = 120
 )
+
+# Saida em UTF-8. Quando o cockpit roda este script via Start-Process
+# -RedirectStandardOutput, o stdout e capturado na codepage do console (NAO
+# UTF-8) e o cockpit le o arquivo como UTF-8 -> acentos viram "�" (ex.:
+# "situa�ao"). Forcar UTF-8 aqui conserta o roundtrip, tanto no modo -PromptFile
+# do cockpit quanto no console interativo. Guardado: headless pode nao ter
+# console pra setar (best-effort).
+try {
+    [Console]::OutputEncoding = [Text.Encoding]::UTF8
+    $OutputEncoding = [Text.Encoding]::UTF8
+} catch {}
+
+# Prompt vindo por arquivo (usado pelo cockpit): evita quebrar aspas/acentos/
+# quebras de linha ao passar texto natural pela linha de comando.
+if (-not [string]::IsNullOrWhiteSpace($PromptFile) -and (Test-Path $PromptFile)) {
+    $Prompt = [System.IO.File]::ReadAllText($PromptFile, [Text.Encoding]::UTF8)
+}
 
 # ============================================================
 # JOULE TERMINAL

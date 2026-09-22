@@ -76,6 +76,68 @@ function Rollover-Tasks($tasks) {
     return $changed
 }
 
+# --- identidade / schema (espelha secondbrain-run.ps1) -----------------------
+# Mesma normalizacao e sbid do orquestrador: assim a tarefa manual casa com a
+# consolidacao de identidade (pessoa+assunto) e nunca vira card orfao no merge.
+function Normalize-Text([string]$s) {
+    if ([string]::IsNullOrWhiteSpace($s)) { return "" }
+    $s = $s.ToLowerInvariant()
+    $norm = $s.Normalize([Text.NormalizationForm]::FormD)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $norm.ToCharArray()) {
+        if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -ne [Globalization.UnicodeCategory]::NonSpacingMark) {
+            [void]$sb.Append($ch)
+        }
+    }
+    $s = $sb.ToString()
+    $s = $s -replace '[^\w\s]', ' '
+    $s = $s -replace '\s+', ' '
+    return $s.Trim()
+}
+
+function New-SBID([string]$pessoa, [string]$assunto) {
+    $key = (Normalize-Text $pessoa) + "|" + (Normalize-Text $assunto)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($key))
+        $hex = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+        return "sb-" + $hex.Substring(0, 12)
+    }
+    finally { $sha.Dispose() }
+}
+
+function Get-ManualCategory([string]$status) {
+    switch ($status) {
+        "fazer"      { "fazer" }
+        "responder"  { "responder" }
+        "cobrar"     { "cobrar" }
+        "aguardando" { "aguardando" }
+        "preparar"   { "preparar" }
+        "risco"      { "risco" }
+        "referencia" { "referencia" }
+        default      { "fazer" }
+    }
+}
+
+function Get-ManualPrefix([string]$status) {
+    switch ($status) {
+        "fazer"      { "Fazer" }
+        "responder"  { "Responder" }
+        "cobrar"     { "Cobrar" }
+        "aguardando" { "Aguardando" }
+        "preparar"   { "Preparar" }
+        "risco"      { "Risco" }
+        "referencia" { "Ref" }
+        default      { "Fazer" }
+    }
+}
+
+function Resolve-ManualBoard([string]$categoria, [string]$prioridade) {
+    if ($categoria -eq "referencia") { return "referencia" }
+    if ($prioridade -eq "baixa")     { return "review" }
+    return "active"
+}
+
 # --- MIME + estaticos --------------------------------------------------------
 function Get-Mime($path) {
     switch ([IO.Path]::GetExtension($path).ToLower()) {
@@ -130,6 +192,74 @@ function Handle-GetTasks($ctx) {
     Send-Json $ctx 200 @($tasks)
 }
 
+function Handle-CreateTask($ctx) {
+    $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [Text.Encoding]::UTF8)
+    $body = $reader.ReadToEnd()
+    $reader.Close()
+
+    $in = $null
+    try { $in = $body | ConvertFrom-Json } catch { Send-Json $ctx 400 @{ error = "JSON invalido" }; return }
+
+    $assunto = ("" + $in.assunto).Trim()
+    if (-not $assunto) { Send-Json $ctx 400 @{ error = "assunto obrigatorio" }; return }
+
+    $pessoa       = ("" + $in.pessoa).Trim()
+    $status       = ("" + $in.status).Trim();     if (-not $status) { $status = "fazer" }
+    $prioridade   = ("" + $in.prioridade).Trim(); if (-not $prioridade) { $prioridade = "media" }
+    $proxima_acao = ("" + $in.proxima_acao).Trim()
+    $notas        = ("" + $in.notas).Trim()
+    $resumo       = ("" + $in.resumo).Trim()
+    $dueDate      = ("" + $in.dueDate).Trim()
+    if ($dueDate) {
+        try { $dueDate = ([datetime]::Parse($dueDate)).ToString("yyyy-MM-dd") } catch { $dueDate = $null }
+    } else { $dueDate = $null }
+
+    $categoria = Get-ManualCategory $status
+    $prefixo   = Get-ManualPrefix $status
+    $board     = Resolve-ManualBoard $categoria $prioridade
+    $sbid      = New-SBID $pessoa $assunto
+    $nowIso    = (Get-Date).ToString("o")
+
+    $tasks = Read-Tasks
+    $existing = $tasks | Where-Object { $_.sbid -eq $sbid } | Select-Object -First 1
+    if ($existing) { Send-Json $ctx 409 @{ error = "Ja existe uma tarefa com essa pessoa+assunto"; task = $existing }; return }
+
+    $titulo = if ($pessoa) { "$pessoa - $assunto" } else { $assunto }
+
+    $new = [pscustomobject]@{
+        sbid         = $sbid
+        titulo       = $titulo
+        prefixo      = $prefixo
+        canal        = "manual"
+        fontes       = @("manual")
+        pessoa       = $pessoa
+        assunto      = $assunto
+        resumo       = $resumo
+        proxima_acao = $proxima_acao
+        responsavel  = ""
+        status       = $status
+        tipo         = ""
+        categoria    = $categoria
+        prioridade   = $prioridade
+        prazo        = $dueDate
+        risco        = ""
+        reuniao_em   = $null
+        dueDate      = $dueDate
+        board        = $board
+        snoozedUntil = $null
+        done         = $false
+        notas        = $notas
+        userTouched  = $nowIso
+        createdAt    = $nowIso
+        updatedAt    = $nowIso
+        history      = @("[$nowIso] criado (manual)")
+    }
+
+    $tasks = @($tasks) + @($new)
+    Write-Tasks $tasks
+    Send-Json $ctx 201 $new
+}
+
 function Handle-PostTask($ctx, [string]$sbid) {
     $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [Text.Encoding]::UTF8)
     $body = $reader.ReadToEnd()
@@ -174,6 +304,113 @@ function Handle-PostTask($ctx, [string]$sbid) {
     Send-Json $ctx 200 $task
 }
 
+# --- Joule (assincrono) ------------------------------------------------------
+# O Joule Desktop e dirigido por CDP (joule-terminal.ps1) e a resposta pode
+# levar ate ~2min (ele le e-mail/calendario via tool-call). Como o HttpListener
+# e single-thread, NAO da pra proxiar inline (travaria o cockpit inteiro).
+# Solucao: POST /api/joule dispara um processo separado e volta na hora com um
+# id; o browser faz poll em GET /api/joule/{id}. O board nunca congela.
+$JouleScript = Join-Path $Root "joule-terminal.ps1"
+$JouleTmp    = Join-Path $Processed "joule-jobs"
+if (-not (Test-Path $JouleTmp)) { New-Item -ItemType Directory -Path $JouleTmp -Force | Out-Null }
+$script:JouleJobs   = @{}
+$script:JouleMaxSec = 210   # guarda-chuva: mata o job se passar disso
+
+function Handle-JouleAsk($ctx) {
+    $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [Text.Encoding]::UTF8)
+    $body = $reader.ReadToEnd()
+    $reader.Close()
+
+    $in = $null
+    try { $in = $body | ConvertFrom-Json } catch { Send-Json $ctx 400 @{ error = "JSON invalido" }; return }
+
+    $prompt = ("" + $in.prompt).Trim()
+    if (-not $prompt) { Send-Json $ctx 400 @{ error = "prompt vazio" }; return }
+
+    if (-not (Test-Path $JouleScript)) { Send-Json $ctx 500 @{ error = "joule-terminal.ps1 nao encontrado" }; return }
+
+    # Injeta o caminho do store como referencia (Joule le o arquivo local sozinho).
+    $full = $prompt + "`r`n`r`nUse o arquivo " + $TasksFile + " (minhas tarefas/pendencias do SecondBrain, em JSON) como referencia para responder."
+
+    $id       = "j-" + ([guid]::NewGuid().ToString("N").Substring(0, 12))
+    $promptFp = Join-Path $JouleTmp "$id.in.txt"
+    $outFp    = Join-Path $JouleTmp "$id.out.txt"
+    $errFp    = Join-Path $JouleTmp "$id.err.txt"
+    [System.IO.File]::WriteAllText($promptFp, $full, $script:Utf8NoBom)
+
+    try {
+        $proc = Start-Process -FilePath "powershell.exe" `
+            -ArgumentList @(
+                "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", $JouleScript,
+                "-PromptFile", $promptFp,
+                "-TimeoutSec", "180"
+            ) `
+            -RedirectStandardOutput $outFp `
+            -RedirectStandardError  $errFp `
+            -WindowStyle Hidden `
+            -PassThru
+    }
+    catch {
+        Send-Json $ctx 500 @{ error = "Nao consegui iniciar o Joule: " + $_.Exception.Message }; return
+    }
+
+    $script:JouleJobs[$id] = [pscustomobject]@{
+        Proc      = $proc
+        OutFile   = $outFp
+        ErrFile   = $errFp
+        InFile    = $promptFp
+        StartedAt = Get-Date
+    }
+    Send-Json $ctx 202 @{ id = $id; status = "pending" }
+}
+
+function Cleanup-JouleJob($job) {
+    foreach ($f in @($job.InFile, $job.OutFile, $job.ErrFile)) {
+        Remove-Item $f -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Handle-JoulePoll($ctx, [string]$id) {
+    $job = $script:JouleJobs[$id]
+    if (-not $job) { Send-Json $ctx 404 @{ error = "job desconhecido"; status = "error" }; return }
+
+    $proc = $job.Proc
+    $exited = $false
+    try { $exited = $proc.HasExited } catch { $exited = $true }
+
+    if (-not $exited) {
+        # Guarda-chuva de tempo: se estourar, mata e devolve erro.
+        if (((Get-Date) - $job.StartedAt).TotalSeconds -gt $script:JouleMaxSec) {
+            try { $proc.Kill() } catch {}
+            $script:JouleJobs.Remove($id)
+            Cleanup-JouleJob $job
+            Send-Json $ctx 200 @{ status = "error"; error = "Joule demorou demais (timeout)." }
+            return
+        }
+        Send-Json $ctx 200 @{ status = "pending" }
+        return
+    }
+
+    # Terminou: le a saida.
+    $out = ""; $err = ""
+    try { if (Test-Path $job.OutFile) { $out = ([System.IO.File]::ReadAllText($job.OutFile, [Text.Encoding]::UTF8)).Trim() } } catch {}
+    try { if (Test-Path $job.ErrFile) { $err = ([System.IO.File]::ReadAllText($job.ErrFile, [Text.Encoding]::UTF8)).Trim() } } catch {}
+
+    $script:JouleJobs.Remove($id)
+    Cleanup-JouleJob $job
+
+    if ($out) {
+        Send-Json $ctx 200 @{ status = "done"; text = $out }
+    }
+    elseif ($err) {
+        Send-Json $ctx 200 @{ status = "error"; error = $err }
+    }
+    else {
+        Send-Json $ctx 200 @{ status = "error"; error = "Joule nao retornou resposta." }
+    }
+}
+
 # --- servidor ----------------------------------------------------------------
 $prefix = "http://127.0.0.1:$Port/"
 $listener = New-Object System.Net.HttpListener
@@ -201,13 +438,31 @@ if ($Open) { Start-Process $prefix }
 
 try {
     while ($listener.IsListening) {
-        $ctx = $listener.GetContext()
+        # NAO usar GetContext() sincrono: ele BLOQUEIA em chamada nativa ate
+        # chegar uma request, e o Ctrl+C do PowerShell (processado so entre
+        # instrucoes) nunca consegue interromper -> o cockpit nao parava.
+        # GetContextAsync + WaitOne(300ms) devolve o controle ao PS a cada 300ms,
+        # deixando o Ctrl+C ser processado entre as iteracoes (o finally para o
+        # listener). Sem isso, so fechando a janela/matando o processo.
+        $task = $listener.GetContextAsync()
+        while (-not ([System.IAsyncResult]$task).AsyncWaitHandle.WaitOne(300)) { }
+        $ctx = $task.GetAwaiter().GetResult()
         try {
             $method = $ctx.Request.HttpMethod
             $path = $ctx.Request.Url.AbsolutePath
 
             if ($method -eq "GET" -and $path -eq "/api/tasks") {
                 Handle-GetTasks $ctx
+            }
+            elseif ($method -eq "POST" -and $path -eq "/api/task") {
+                Handle-CreateTask $ctx
+            }
+            elseif ($method -eq "POST" -and $path -eq "/api/joule") {
+                Handle-JouleAsk $ctx
+            }
+            elseif ($method -eq "GET" -and $path -like "/api/joule/*") {
+                $jid = [System.Uri]::UnescapeDataString($path.Substring("/api/joule/".Length))
+                Handle-JoulePoll $ctx $jid
             }
             elseif ($method -eq "POST" -and $path -like "/api/task/*") {
                 $sbid = [System.Uri]::UnescapeDataString($path.Substring("/api/task/".Length))
