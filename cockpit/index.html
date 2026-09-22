@@ -34,6 +34,8 @@
       <input id="search" type="text" placeholder="buscar pessoa, assunto…" autocomplete="off" />
       <label class="toggle"><input type="checkbox" id="show-ref" /> <span>referência / baixa</span></label>
       <label class="toggle"><input type="checkbox" id="show-done" /> <span>concluídas</span></label>
+      <button id="new-task" title="Nova tarefa manual">＋ Nova</button>
+      <button id="agent-toggle" title="Perguntar ao agente (IA local ou Joule)">🧠 Agente</button>
       <button id="refresh" title="Recarregar">⟳</button>
     </div>
   </header>
@@ -47,6 +49,89 @@
   </main>
 
   <div id="toast" class="toast"></div>
+
+  <div id="modal-backdrop" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-head">
+        <span id="modal-title">Nova tarefa</span>
+        <button id="modal-close" class="modal-close" title="Fechar">✕</button>
+      </div>
+      <form id="task-form" class="modal-body">
+        <label>Assunto *
+          <input id="f-assunto" type="text" required autocomplete="off" placeholder="o que precisa ser feito" />
+        </label>
+        <label>Pessoa
+          <input id="f-pessoa" type="text" autocomplete="off" placeholder="quem (opcional)" />
+        </label>
+        <div class="modal-row">
+          <label>Tipo
+            <select id="f-status">
+              <option value="fazer">Fazer</option>
+              <option value="responder">Responder</option>
+              <option value="cobrar">Cobrar</option>
+              <option value="aguardando">Aguardando</option>
+              <option value="preparar">Preparar reunião</option>
+              <option value="risco">Risco</option>
+              <option value="referencia">Referência</option>
+            </select>
+          </label>
+          <label>Prioridade
+            <select id="f-prioridade">
+              <option value="alta">Alta</option>
+              <option value="media" selected>Média</option>
+              <option value="baixa">Baixa</option>
+            </select>
+          </label>
+          <label>Prazo
+            <input id="f-due" type="date" />
+          </label>
+        </div>
+        <label>Próxima ação
+          <input id="f-acao" type="text" autocomplete="off" placeholder="→ passo concreto (opcional)" />
+        </label>
+        <label>Notas
+          <textarea id="f-notas" rows="2" placeholder="detalhes (opcional)"></textarea>
+        </label>
+        <div class="modal-actions">
+          <button type="button" id="modal-cancel" class="btn-ghost">Cancelar</button>
+          <button type="submit" class="btn-primary">Criar tarefa</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="agent-panel" class="agent-panel" hidden>
+    <div class="agent-head">
+      <div class="agent-title">
+        <span class="agent-glyph">🧠</span>
+        <span>Agente</span>
+      </div>
+      <div class="agent-target" role="tablist" aria-label="Escolher IA">
+        <button id="tgt-local" class="agent-tgt" data-target="local"
+                title="Modelo local (llama) — sabe dos seus cards, resposta em streaming">IA local</button>
+        <button id="tgt-joule" class="agent-tgt active" data-target="joule"
+                title="Joule (SAP) — lê o seu tasks.json e responde">Joule</button>
+      </div>
+      <div class="agent-head-btns">
+        <button id="agent-clear" class="agent-icon" title="Limpar conversa">🗑</button>
+        <button id="agent-close" class="agent-icon" title="Fechar">✕</button>
+      </div>
+    </div>
+
+    <div id="agent-log" class="agent-log">
+      <div class="agent-hint" id="agent-hint">
+        Pergunte algo sobre suas tarefas — ex.: <em>"o que é mais urgente hoje?"</em>,
+        <em>"resume o que o cliente X pediu"</em>, <em>"onde tem risco?"</em>.
+        <br />A <strong>IA local</strong> responde na hora e já conhece seus cards.
+        O <strong>Joule</strong> lê o seu <code>tasks.json</code> e pode demorar mais.
+      </div>
+    </div>
+
+    <div class="agent-foot">
+      <textarea id="agent-input" rows="1" placeholder="Perguntar ao Joule…  (ele lê seu tasks.json)" autocomplete="off"></textarea>
+      <button id="agent-send" class="agent-send" title="Enviar">➤</button>
+    </div>
+  </div>
 
   <script src="/app.js"></script>
 </body>
