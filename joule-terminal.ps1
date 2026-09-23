@@ -218,6 +218,32 @@ function Invoke-JouleCDP {
         ).GetAwaiter().GetResult() | Out-Null
 
 
+        # Anti-throttle (rodada agendada / janela em segundo plano): forca o
+        # renderer a "ativo" e com foco emulado ANTES de avaliar, senao o app do
+        # Joule pausa o pipeline de chat e o onEvent nunca entrega a resposta.
+        # Best-effort: ids fixos < 10000 (nao colidem com o $id aleatorio abaixo);
+        # os acks sao ignorados pelo loop de recepcao (msg.id != $id -> continue).
+        $prelude = @(
+            @{ id = 1; method = "Page.enable"; params = @{} },
+            @{ id = 2; method = "Page.setWebLifecycleState"; params = @{ state = "active" } },
+            @{ id = 3; method = "Emulation.setFocusEmulationEnabled"; params = @{ enabled = $true } }
+        )
+        foreach ($cmd in $prelude) {
+            try {
+                $pbytes = [Text.Encoding]::UTF8.GetBytes(
+                    ($cmd | ConvertTo-Json -Compress -Depth 10)
+                )
+                $ws.SendAsync(
+                    [ArraySegment[byte]]::new($pbytes),
+                    [System.Net.WebSockets.WebSocketMessageType]::Text,
+                    $true,
+                    $ct
+                ).GetAwaiter().GetResult() | Out-Null
+            }
+            catch {}
+        }
+
+
         $id = Get-Random `
             -Minimum 10000 `
             -Maximum 99999
@@ -406,6 +432,17 @@ function Ask-Joule {
     const existingThreadId = $threadJson;
 
 
+    // Anti-throttle (JS puro, complementa o Emulation.setFocusEmulationEnabled via
+    // CDP): finge foco + visivel para o app nao pausar o chat em segundo plano.
+    try {
+        document.hasFocus = () => true;
+        Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+        Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+        window.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("visibilitychange"));
+    } catch (e) {}
+
+
     if (
         !window.api ||
         !window.api.chat ||
@@ -424,6 +461,7 @@ function Ask-Joule {
         let finished = false;
         let threadId = existingThreadId || null;
         let unsubscribe = null;
+        let keepAlive = null;
 
 
         const finish = (value) => {
@@ -433,6 +471,8 @@ function Ask-Joule {
             finished = true;
 
             clearTimeout(timer);
+
+            try { clearInterval(keepAlive); } catch {}
 
             try {
                 unsubscribe?.();
@@ -450,6 +490,16 @@ function Ask-Joule {
             });
 
         }, $timeoutMs);
+
+
+        // Reafirma foco/visibilidade a cada 8s: se a janela re-throttlar durante a
+        // geracao longa, mantem o pipeline do Joule entregando eventos.
+        keepAlive = setInterval(() => {
+            try {
+                document.dispatchEvent(new Event("visibilitychange"));
+                window.dispatchEvent(new Event("focus"));
+            } catch (e) {}
+        }, 8000);
 
 
         unsubscribe =

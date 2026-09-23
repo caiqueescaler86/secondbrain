@@ -4,6 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SecondBrain · Cockpit</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="256x256" href="/favicon-256.png" />
+  <link rel="apple-touch-icon" href="/favicon-256.png" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -11,7 +14,7 @@
 
   <header class="topbar">
     <div class="brand">
-      <span class="logo">◇</span>
+      <img class="logo" src="/favicon-256.png" alt="SecondBrain" />
       <div class="brand-txt">
         <div class="brand-name">SECOND<span>BRAIN</span></div>
         <div class="brand-sub">cockpit local · 127.0.0.1</div>
@@ -34,8 +37,13 @@
       <input id="search" type="text" placeholder="buscar pessoa, assunto…" autocomplete="off" />
       <label class="toggle"><input type="checkbox" id="show-ref" /> <span>referência / baixa</span></label>
       <label class="toggle"><input type="checkbox" id="show-done" /> <span>concluídas</span></label>
+      <div class="sort-toggle" role="group" aria-label="Ordenar">
+        <button id="sort-prio" class="sort-btn active" title="Ordenar por prioridade">prioridade</button>
+        <button id="sort-date" class="sort-btn" title="Ordenar por data (prazo)">data</button>
+      </div>
       <button id="new-task" title="Nova tarefa manual">＋ Nova</button>
       <button id="agent-toggle" title="Perguntar ao agente (IA local ou Joule)">🧠 Agente</button>
+      <button id="expand-all" title="Expandir todos os cards visíveis">⤢</button>
       <button id="refresh" title="Recarregar">⟳</button>
     </div>
   </header>

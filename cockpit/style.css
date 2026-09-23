@@ -66,11 +66,23 @@ html, body {
 
 .brand { display: flex; align-items: center; gap: 12px; }
 .brand .logo {
-  font-size: 26px; color: var(--accent);
-  text-shadow: 0 0 12px var(--glow);
+  height: 32px; width: auto; flex: none;
+  object-fit: contain; vertical-align: middle;
+  filter: drop-shadow(0 0 6px var(--glow));
   animation: pulse 4s ease-in-out infinite;
 }
-@keyframes pulse { 0%,100%{opacity:.75;} 50%{opacity:1; text-shadow:0 0 18px var(--glow);} }
+@keyframes pulse { 0%,100%{opacity:.85; filter: drop-shadow(0 0 5px var(--glow));} 50%{opacity:1; filter: drop-shadow(0 0 11px var(--glow));} }
+
+/* Micro-reward ao concluir (dopamina): burst de confete no ponto do clique. */
+.confetti {
+  position: fixed; width: 8px; height: 8px; border-radius: 2px;
+  pointer-events: none; z-index: 9999; will-change: transform, opacity;
+  animation: confetti-fly .72s cubic-bezier(.15,.7,.3,1) forwards;
+}
+@keyframes confetti-fly {
+  0%   { transform: translate(0,0) scale(1) rotate(0);      opacity: 1; }
+  100% { transform: translate(var(--dx), var(--dy)) scale(.3) rotate(220deg); opacity: 0; }
+}
 .brand-name { font-weight: 700; letter-spacing: 3px; font-size: 15px; }
 .brand-name span { color: var(--accent); }
 .brand-sub { font-family: var(--mono); font-size: 10px; color: var(--txt-mute); letter-spacing: 1px; }
@@ -103,6 +115,25 @@ html, body {
 }
 #refresh:hover { border-color: var(--line-hot); }
 #refresh.spin { transform: rotate(360deg); }
+
+/* expandir/recolher todos os cards visiveis */
+#expand-all {
+  background: var(--panel); border: 1px solid var(--line); color: var(--accent);
+  border-radius: 8px; width: 36px; height: 34px; font-size: 16px; cursor: pointer;
+  transition: border-color .2s, box-shadow .2s;
+}
+#expand-all:hover { border-color: var(--line-hot); box-shadow: 0 0 0 3px rgba(56,225,214,0.08); }
+
+/* toggle de ordenacao: prioridade | data (segmentado) */
+.sort-toggle { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.sort-btn {
+  background: transparent; border: none; color: var(--txt-dim);
+  font-family: var(--mono); font-size: 11px; padding: 8px 10px; cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.sort-btn + .sort-btn { border-left: 1px solid var(--line); }
+.sort-btn:hover { color: var(--txt); }
+.sort-btn.active { background: rgba(56,225,214,0.14); color: var(--accent); }
 
 /* ---------------- barra de filtro ativo (agente) ---------------- */
 .filter-bar {

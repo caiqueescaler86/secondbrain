@@ -147,6 +147,7 @@ function Get-Mime($path) {
         ".json" { "application/json; charset=utf-8" }
         ".svg"  { "image/svg+xml" }
         ".ico"  { "image/x-icon" }
+        ".png"  { "image/png" }
         default { "application/octet-stream" }
     }
 }

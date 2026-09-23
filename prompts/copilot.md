@@ -1,6 +1,6 @@
 Pesquise AGORA nos meus dados do Microsoft 365 (chats e canais do Teams, transcrições de reunião e e-mails) da janela {{JANELA}} e me devolva os itens operacionais. NÃO reescreva, NÃO otimize e NÃO comente este pedido: execute a busca e responda apenas com o resultado no formato pedido abaixo.
 
-Considere só o que exige ação, dependência, prazo, risco ou acompanhamento. Use e-mail como segunda fonte para validar/complementar o que vier de Teams e transcrições (cross-check). Elimine duplicidades entre as fontes.
+Considere só o que exige ação, dependência, prazo, risco ou acompanhamento. Use e-mail como segunda fonte para validar/complementar o que vier de Teams e transcrições (cross-check). Elimine duplicidades entre as fontes. Revise com cautela para não faltar dados.
 
 Levante:
 1. Action points de transcrições.

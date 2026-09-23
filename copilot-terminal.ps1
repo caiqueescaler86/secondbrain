@@ -366,6 +366,37 @@ function Set-CopilotModel {
     }
 }
 
+function Restart-CopilotApp {
+    # O WebView2 do M365Copilot pode travar num estado morto: o editor aceita o
+    # texto mas a geracao nunca comeca (sawStop=false, copy=0, editorLen>0). Nesse
+    # caso a UNICA coisa que destrava e reiniciar o app inteiro. Fecha a sessao CDP
+    # obsoleta, derruba o processo (mesma descoberta usada por Start-CopilotBridge),
+    # relanca com o debug ligado (reaproveita Enable-CopilotDebug) e espera a porta
+    # CDP voltar ativa (nao-suspensa).
+    Close-CopilotSession
+
+    $running = Get-Process M365Copilot -ErrorAction SilentlyContinue
+    if ($running) {
+        $running | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+
+    Enable-CopilotDebug
+    Start-Process $global:CopilotApp
+
+    $deadline = (Get-Date).AddSeconds(90)
+
+    do {
+        Start-Sleep -Milliseconds 800
+
+        if (Test-CopilotCDP -and -not (Test-CopilotSuspended)) {
+            return
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    throw "Copilot nao voltou apos reiniciar o app (porta CDP $global:CopilotPort nao ficou ativa)."
+}
+
 function Ask-Copilot {
     param(
         [Parameter(Position = 0)]
@@ -381,6 +412,34 @@ function Ask-Copilot {
     if ([string]::IsNullOrWhiteSpace($Prompt)) {
         return
     }
+
+    # Wrapper resiliente: se o WebView travar (editor preenchido, geracao nunca
+    # comeca) reinicia o app e retenta UMA vez. No maximo 2 tentativas no total.
+    $maxAttempts = 2
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $result = Invoke-CopilotAsk -Prompt $Prompt -TimeoutSec $TimeoutSec
+
+        if (-not $result.wedged) {
+            return $result.text
+        }
+
+        if ($attempt -lt $maxAttempts) {
+            Write-Host "Copilot travado (editor preenchido, geracao nao iniciou) -> reiniciando o app e retentando ($attempt/$maxAttempts)..."
+            Restart-CopilotApp
+        }
+    }
+
+    throw "Copilot travado: a geracao nao iniciou mesmo apos reiniciar o app (editor preenchido, sem resposta)."
+}
+
+function Invoke-CopilotAsk {
+    param(
+        [Parameter(Position = 0)]
+        [string]$Prompt,
+
+        [int]$TimeoutSec = 120
+    )
 
     Open-CopilotSession -TimeoutSec ($TimeoutSec + 60)
 
@@ -497,6 +556,24 @@ function Ask-Copilot {
                 Send-CDP "Input.dispatchKeyEvent" @{ type="keyDown"; key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
                 Send-CDP "Input.dispatchKeyEvent" @{ type="keyUp";   key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
             }
+
+            # Depois do reenvio, confere de novo se a geracao comecou. Se mesmo
+            # assim o Stop nao aparecer em ~8s, o WebView travou (editor cheio,
+            # nada gerado): sinaliza wedged para o wrapper reiniciar o app e
+            # retentar, em vez de gastar o TimeoutSec inteiro no poll.
+            $genStarted = $false
+            $resendDeadline = (Get-Date).AddSeconds(8)
+            do {
+                Start-Sleep -Milliseconds 400
+                $genStarted = [bool](Send-CDP "Runtime.evaluate" @{
+                    returnByValue = $true
+                    expression = '(()=>!!(document.querySelector(''button[aria-label="Stop"]'')||document.querySelector(''button[aria-label="Stop generating"]'')||document.querySelector(''button[aria-label="Parar"]'')))()'
+                })
+            } while (-not $genStarted -and (Get-Date) -lt $resendDeadline)
+
+            if (-not $genStarted) {
+                return @{ wedged = $true }
+            }
         }
 
         # 7) Aguarda a RESPOSTA FINAL. Sinal robusto, independente de quantos steps
@@ -516,6 +593,18 @@ function Ask-Copilot {
 (async () => {
     const baseCopy = $existingCopyCount;
     const timeoutMs = $timeoutMs;
+
+    // Anti-throttle: mantem a pagina "visivel/focada" p/ o app continuar
+    // STREAMando a resposta mesmo com a janela em segundo plano (rodada agendada).
+    // Complementa o Emulation.setFocusEmulationEnabled + setWebLifecycleState (CDP,
+    // aplicados na abertura) que perdem efeito quando a pagina re-throttla durante
+    // a geracao longa.
+    try {
+        document.hasFocus = () => true;
+        Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" });
+        Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+        document.dispatchEvent(new Event("visibilitychange"));
+    } catch (e) {}
 
     const stopVisible = () => !!(
         document.querySelector('button[aria-label="Stop"]') ||
@@ -548,6 +637,9 @@ function Ask-Copilot {
         const finish = value => { clearInterval(timer); resolve(value); };
 
         const timer = setInterval(() => {
+            // reafirma "visivel" a cada tick: se a janela re-throttlar no meio da
+            // geracao, o app continua pintando/streamando a resposta no DOM.
+            try { document.dispatchEvent(new Event("visibilitychange")); } catch (e) {}
             const stop = stopVisible();
             const copy = document.querySelectorAll('[data-testid="CopyButtonTestId"]').length;
             const text = readLast();
@@ -594,15 +686,23 @@ function Ask-Copilot {
             throw "Copilot nao retornou resultado."
         }
         if (-not $poll.ok) {
+            $d = $poll.diag
+
+            # Assinatura de WebView travado: prompt digitado (editorLen>0) mas a
+            # geracao nunca comecou (sawStop=false, copy=0). Sinaliza wedged para
+            # o wrapper reiniciar o app e retentar.
+            if ($d -and (-not $d.sawStop) -and ([int]$d.copy -eq 0) -and ([int]$d.editorLen -gt 0)) {
+                return @{ wedged = $true }
+            }
+
             $msg = [string]$poll.error
-            if ($poll.diag) {
-                $d = $poll.diag
+            if ($d) {
                 $msg += " [diag: sawStop=$($d.sawStop) mdReply=$($d.mdReply) copy=$($d.copy) editorLen=$($d.editorLen) elapsed=$($d.elapsed)s]"
             }
             throw $msg
         }
 
-        return $poll.text
+        return @{ wedged = $false; text = $poll.text }
     }
     finally {
         Close-CopilotSession

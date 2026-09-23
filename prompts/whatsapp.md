@@ -1,6 +1,6 @@
 # Prompt WhatsApp → JSON
 
-Usado pelo `analyze-whatsapp.ps1 -Json` (contrato do que o modelo local recebe). Analisa as mensagens dos últimos N dias e separa pendências pessoais e de trabalho.
+Usado pelo `analyze-whatsapp.ps1 -Json` (contrato do que o modelo local recebe). Analisa as mensagens dos últimos N dias e separa pendências pessoais e de trabalho. Tente identificar se a pendencia é sobre Emarsys ou Caíque.
 
 Identifica:
 1. Quem eu preciso responder.

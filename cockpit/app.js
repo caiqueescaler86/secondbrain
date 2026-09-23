@@ -20,7 +20,7 @@ const PREFIX = {
   aguardando: "Aguardando", preparar: "Preparar", risco: "Risco", referencia: "Ref",
 };
 
-let STATE = { tasks: [], search: "", showRef: false, showDone: false, open: new Set(), filter: null, sig: "" };
+let STATE = { tasks: [], search: "", showRef: false, showDone: false, open: new Set(), filter: null, sig: "", sort: (localStorage.getItem("sb-sort") === "data" ? "data" : "prio") };
 
 const STATUS_KEYS = ["fazer", "responder", "cobrar", "aguardando", "preparar", "risco", "referencia"];
 const PRIO_KEYS = ["alta", "media", "baixa"];
@@ -45,6 +45,27 @@ function toast(msg) {
   t.classList.add("show");
   clearTimeout(toast._t);
   toast._t = setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+// Micro-reward ao concluir (dopamina/TDAH): burst de confete no ponto do clique +
+// elogio curto. Visual apenas, sem som. Respeita prefers-reduced-motion.
+const CHEERS = ["✓ feito!", "boa!", "mandou bem 💪", "menos um!", "🔥 foco!", "isso aí!"];
+function celebrate(x, y) {
+  toast(CHEERS[Math.floor(Math.random() * CHEERS.length)]);
+  if (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const n = 16;
+  for (let i = 0; i < n; i++) {
+    const p = el("div", "confetti");
+    p.style.left = x + "px";
+    p.style.top = y + "px";
+    p.style.background = "hsl(" + Math.floor(Math.random() * 360) + " 90% 62%)";
+    const ang = (Math.PI * 2 * i) / n + Math.random();
+    const dist = 45 + Math.random() * 65;
+    p.style.setProperty("--dx", (Math.cos(ang) * dist).toFixed(1) + "px");
+    p.style.setProperty("--dy", (Math.sin(ang) * dist - 30).toFixed(1) + "px");
+    document.body.appendChild(p);
+    setTimeout(() => p.remove(), 780);
+  }
 }
 
 function dueInfo(task) {
@@ -102,7 +123,12 @@ async function patch(sbid, body) {
     const updated = await res.json();
     const i = STATE.tasks.findIndex(t => t.sbid === sbid);
     if (i >= 0 && updated && updated.sbid) STATE.tasks[i] = updated;
-    render();
+    // Sem "blink": atualiza SO o card afetado, sem recriar o board inteiro.
+    // Render completo so quando o card pode sumir/trocar de secao (concluir/adiar).
+    const structural = ("done" in body) || ("snoozedUntil" in body);
+    if (structural || !replaceCardInPlace(sbid)) render();
+    else { updateStats(); renderFilterBar(); }
+    STATE.sig = JSON.stringify(STATE.tasks);
   } catch (e) {
     toast("Não consegui salvar");
     console.error(e);
@@ -216,6 +242,17 @@ const byPrio = (a, b) => {
   if (dp) return dp;
   return (a.dueDate || "9999").localeCompare(b.dueDate || "9999");
 };
+// Ordena por data (prazo) crescente: mais atrasado/proximo primeiro; sem prazo por
+// ultimo. Empate cai no criterio de prioridade.
+const byDate = (a, b) => {
+  const da = a.dueDate, db = b.dueDate;
+  if (!da && !db) return byPrio(a, b);
+  if (!da) return 1;
+  if (!db) return -1;
+  return da.localeCompare(db) || byPrio(a, b);
+};
+// Comparador ativo conforme o modo escolhido (persistido em localStorage).
+const sortCmp = () => (STATE.sort === "data" ? byDate : byPrio);
 const isRef = t => (t.categoria === "referencia") || (t.board && t.board !== "active");
 const isWaiting = t => (t.status === "aguardando") || (t.categoria === "aguardando");
 
@@ -239,6 +276,7 @@ function feedSection(title, list, cls, feed) {
 function render() {
   updateStats();
   renderFilterBar();
+  updateExpandBtn();
   const board = $("#board");
   board.innerHTML = "";
 
@@ -259,9 +297,10 @@ function render() {
     return;
   }
 
-  const agora = shown.filter(t => !isRef(t) && !isWaiting(t)).sort(byPrio);
-  const aguardando = shown.filter(t => !isRef(t) && isWaiting(t)).sort(byPrio);
-  const referencia = shown.filter(isRef).sort(byPrio);
+  const cmp = sortCmp();
+  const agora = shown.filter(t => !isRef(t) && !isWaiting(t)).sort(cmp);
+  const aguardando = shown.filter(t => !isRef(t) && isWaiting(t)).sort(cmp);
+  const referencia = shown.filter(isRef).sort(cmp);
 
   if (agora.length)      board.appendChild(feedSection("O que importa agora", agora, "feed", true));
   if (aguardando.length) board.appendChild(feedSection("Aguardando os outros", aguardando, "cat-aguardando", false));
@@ -270,6 +309,7 @@ function render() {
 
 function renderCard(task) {
   const card = el("div", "card prio-" + (task.prioridade || "media"));
+  card.dataset.sbid = task.sbid;
   if (task.done) card.classList.add("done");
   if (STATE.open.has(task.sbid)) card.classList.add("open");
 
@@ -278,7 +318,7 @@ function renderCard(task) {
   const quick = el("button", "card-check" + (task.done ? " on" : ""), "✓");
   quick.title = task.done ? "Reabrir (1 clique)" : "Concluir (1 clique)";
   quick.setAttribute("aria-label", quick.title);
-  quick.addEventListener("click", e => { e.stopPropagation(); patch(task.sbid, { done: !task.done }); });
+  quick.addEventListener("click", e => { e.stopPropagation(); if (!task.done) celebrate(e.clientX, e.clientY); patch(task.sbid, { done: !task.done }); });
   top.appendChild(quick);
   top.appendChild(el("span", "badge st-" + (task.status || "x"), PREFIX[task.status] || task.status || "•"));
   if (task.prioridade) top.appendChild(el("span", "badge " + task.prioridade, task.prioridade));
@@ -328,7 +368,7 @@ function renderCard(task) {
 
   const actions = el("div", "card-actions");
   const bDone = el("button", "btn-done", task.done ? "↺ Reabrir" : "✓ Feito");
-  bDone.addEventListener("click", e => { e.stopPropagation(); patch(task.sbid, { done: !task.done }); });
+  bDone.addEventListener("click", e => { e.stopPropagation(); if (!task.done) celebrate(e.clientX, e.clientY); patch(task.sbid, { done: !task.done }); });
   const bSnooze = el("button", "btn-snooze", "⏱ Adiar");
   bSnooze.addEventListener("click", e => {
     e.stopPropagation();
@@ -351,6 +391,19 @@ function renderCard(task) {
     if (isOpen) STATE.open.add(task.sbid); else STATE.open.delete(task.sbid);
   });
   return card;
+}
+
+// Troca SO o card afetado no DOM (sem recriar o board) -> mata o "blink" ao salvar
+// notas/prazo/prioridade. Retorna false se o card nao esta na tela (ai o chamador
+// faz render() completo).
+function replaceCardInPlace(sbid) {
+  const updated = STATE.tasks.find(t => t.sbid === sbid);
+  if (!updated) return false;
+  const sel = (window.CSS && CSS.escape) ? CSS.escape(sbid) : sbid;
+  const old = $("#board").querySelector('.card[data-sbid="' + sel + '"]');
+  if (!old) return false;
+  old.replaceWith(renderCard(updated));
+  return true;
 }
 
 // ---------- agente (IA local streaming | Joule assincrono) ----------
@@ -706,6 +759,32 @@ async function askFilter(q, bubble) {
 function applyFilter(f) { STATE.filter = f; render(); }
 function clearFilter() { STATE.filter = null; render(); }
 
+// ---------- expandir/recolher todos (respeita filtro/busca atuais) ----------
+// Atua so nos cards VISIVEIS via o mesmo Set STATE.open que o render() reaplica.
+function toggleExpandAll() {
+  const vis = STATE.tasks.filter(visible);
+  const allOpen = vis.length > 0 && vis.every(t => STATE.open.has(t.sbid));
+  for (const t of vis) { if (allOpen) STATE.open.delete(t.sbid); else STATE.open.add(t.sbid); }
+  render();
+}
+function updateExpandBtn() {
+  const btn = $("#expand-all");
+  if (!btn) return;
+  const vis = STATE.tasks.filter(visible);
+  const allOpen = vis.length > 0 && vis.every(t => STATE.open.has(t.sbid));
+  btn.textContent = allOpen ? "⤡" : "⤢";
+  btn.title = allOpen ? "Recolher todos os cards visíveis" : "Expandir todos os cards visíveis";
+}
+
+// ---------- ordenacao do board (prioridade | data), persistida ----------
+function setSort(mode) {
+  STATE.sort = (mode === "data") ? "data" : "prio";
+  localStorage.setItem("sb-sort", STATE.sort);
+  $("#sort-prio").classList.toggle("active", STATE.sort === "prio");
+  $("#sort-date").classList.toggle("active", STATE.sort === "data");
+  render();
+}
+
 function renderFilterBar() {
   const bar = $("#filter-bar");
   if (!bar) return;
@@ -776,6 +855,9 @@ $("#search").addEventListener("input", e => { STATE.search = e.target.value.trim
 $("#show-ref").addEventListener("change", e => { STATE.showRef = e.target.checked; render(); });
 $("#show-done").addEventListener("change", e => { STATE.showDone = e.target.checked; render(); });
 $("#refresh").addEventListener("click", load);
+$("#expand-all").addEventListener("click", toggleExpandAll);
+$("#sort-prio").addEventListener("click", () => setSort("prio"));
+$("#sort-date").addEventListener("click", () => setSort("data"));
 
 // nova tarefa manual
 $("#new-task").addEventListener("click", openModal);
@@ -817,6 +899,9 @@ $("#task-form").addEventListener("submit", async e => {
 tickClock();
 setInterval(tickClock, 10000);
 setAgentTarget(AGENT.target); // sincroniza toggle/placeholder com o alvo padrao (Joule)
+// sincroniza o toggle de ordenacao com o modo persistido antes do 1o render
+$("#sort-prio").classList.toggle("active", STATE.sort === "prio");
+$("#sort-date").classList.toggle("active", STATE.sort === "data");
 load();
 
 // auto-refresh 1 min — mas NAO enquanto o usuario mexe: se ha um campo em foco

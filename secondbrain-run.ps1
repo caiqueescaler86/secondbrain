@@ -45,6 +45,7 @@ $LogsDir    = Join-Path $Root "logs"
 $RawDir     = Join-Path $Root "raw"
 $Processed  = Join-Path $Root "processed"
 $TasksFile  = Join-Path $Processed "tasks.json"
+$LastRunFile = Join-Path $Processed "last-run.json"
 
 $JoulePs    = Join-Path $Root "joule-terminal.ps1"
 $CopilotPs  = Join-Path $Root "copilot-terminal.ps1"
@@ -117,6 +118,13 @@ if (-not $SkipJoule) {
             try {
                 Start-Process -FilePath $jouleExe -ArgumentList @("--remote-debugging-address=127.0.0.1", "--remote-debugging-port=9222")
                 Log "  Joule Desktop: fechado -> abrindo com CDP (:9222)." Yellow
+                # Aguarda a porta CDP ficar disponivel (max 45s), igual ao Firefox/WhatsApp.
+                # Sem essa espera, o canal Joule dispara a query antes do app estar pronto.
+                $jouleDeadline = (Get-Date).AddSeconds(45)
+                while ((Get-Date) -lt $jouleDeadline) {
+                    if (Test-TcpPort '127.0.0.1' 9222 500) { Log "  Joule Desktop: CDP ativo." Green; break }
+                    Start-Sleep -Milliseconds 800
+                }
             } catch { Log "  Joule Desktop: falha ao abrir ($($_.Exception.Message)); o canal tenta de novo." DarkYellow }
         } else {
             Log "  Joule Desktop: exe nao encontrado; o canal Joule tenta abrir sozinho." DarkYellow
@@ -585,10 +593,12 @@ foreach ($raw in $allItems) {
 $consList = @($consolidated.Values)
 Log "Consolidados (unicos por SB-ID): $($consList.Count)." Gray
 
-# Salva o snapshot consolidado desta rodada.
-$consFile = Join-Path $Processed "consolidated-$ts.json"
-[System.IO.File]::WriteAllText($consFile, (@($consList) | ConvertTo-Json -Depth 20), $Utf8NoBom)
-Log "Snapshot: $consFile" DarkGray
+# Snapshot de AUDITORIA: o consolidado COMPLETO desta rodada (util p/ debug da
+# consolidacao). O snapshot "oficial" (consolidated-$ts.json) e o INCREMENTO,
+# gravado apos o merge -- so o que e novo/alterado desde a ultima rodada c/ sucesso.
+$consFullFile = Join-Path $Processed "consolidated-$ts.full.json"
+[System.IO.File]::WriteAllText($consFullFile, (@($consList) | ConvertTo-Json -Depth 20), $Utf8NoBom)
+Log "Snapshot completo (auditoria): $consFullFile" DarkGray
 
 # ============================================================
 # BOARD (visibilidade) + carga inicial
@@ -626,11 +636,44 @@ function Write-Store($tasks) {
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
 }
 
+# Estado global do orquestrador: o timestamp da ULTIMA rodada com sucesso
+# (consolidou + gravou o store sem erro fatal). Serve de marco p/ o snapshot
+# incremental ("o que mudou desde entao"). DryRun NAO avanca esse marco.
+function Read-LastSuccessRun {
+    if (-not (Test-Path $LastRunFile)) { return $null }
+    try {
+        $raw = [System.IO.File]::ReadAllText($LastRunFile, [Text.Encoding]::UTF8)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        $obj = $raw | ConvertFrom-Json
+        if ($obj -and $obj.lastSuccessRun) { return [string]$obj.lastSuccessRun }
+        return $null
+    }
+    catch { return $null }
+}
+
+function Write-LastSuccessRun([string]$iso) {
+    $json = ([pscustomobject]@{ lastSuccessRun = $iso }) | ConvertTo-Json -Depth 5
+    $tmp = "$LastRunFile.tmp"
+    [System.IO.File]::WriteAllText($tmp, $json, $Utf8NoBom)
+    [System.IO.File]::Copy($tmp, $LastRunFile, $true)
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+}
+
 $nowIso = (Get-Date).ToString("o")
 $stats = @{ new = 0; updated = 0; rolled = 0; review = 0 }
 $reviewItems = New-Object System.Collections.ArrayList
 
 $store = Read-Store
+
+# Marco da ultima rodada com sucesso (o store atual reflete esse estado, pois so
+# gravamos o store em rodada bem-sucedida e nao-DryRun). Usado como "desde quando"
+# do snapshot incremental; avancado no fim, so em caso de sucesso e sem DryRun.
+$lastSuccessRun = Read-LastSuccessRun
+Log ("Ultima rodada com sucesso: " + $(if ($lastSuccessRun) { $lastSuccessRun } else { "(nenhuma)" })) DarkGray
+
+# Itens do snapshot INCREMENTAL: novos ou com conteudo alterado desde a ultima
+# rodada com sucesso (comparados por SB-ID contra o store anterior a este merge).
+$deltaItems = New-Object System.Collections.ArrayList
 
 # --- Consistencia de identidade (idempotente) -------------------------------
 # A identidade agora e pessoa+assunto (sem status). Recalcula o sbid de cada
@@ -674,6 +717,26 @@ foreach ($c in $consList) {
     if ($byId.ContainsKey($c.sbid)) {
         $ex = $byId[$c.sbid]
         $userTouched = ($ex.PSObject.Properties.Name -contains 'userTouched') -and $ex.userTouched
+
+        # Delta: antes de sobrescrever, compara o conteudo semantico do card
+        # existente (= estado da ultima rodada c/ sucesso) com o consolidado desta
+        # rodada. Se algo relevante mudou, entra no snapshot incremental. Campos
+        # derivados de data (dueDate) ficam de fora: rolam sozinhos todo dia e
+        # poluiriam o incremento. Este e o sinal mais confiavel aqui, ja que os
+        # itens consolidados nao carregam timestamp por-item.
+        $changed = (
+            [string]$ex.titulo       -ne [string]$c.titulo       -or
+            [string]$ex.prefixo      -ne [string]$c.prefixo      -or
+            [string]$ex.status       -ne [string]$c.status       -or
+            [string]$ex.categoria    -ne [string]$c.categoria    -or
+            [string]$ex.prioridade   -ne [string]$c.prioridade   -or
+            [string]$ex.resumo       -ne [string]$c.resumo       -or
+            [string]$ex.proxima_acao -ne [string]$c.proxima_acao -or
+            [string]$ex.prazo        -ne [string]$c.prazo        -or
+            [string]$ex.risco        -ne [string]$c.risco        -or
+            [string]$ex.reuniao_em   -ne [string]$c.reuniao_em
+        )
+        if ($changed) { [void]$deltaItems.Add($c) }
 
         # Atualiza conteudo, PRESERVA estado do usuario (done/snooze/notas).
         $ex.titulo       = $c.titulo
@@ -737,6 +800,7 @@ foreach ($c in $consList) {
         $store = @($store) + @($new)
         $byId[$c.sbid] = $new
         $stats.new++
+        [void]$deltaItems.Add($c)   # item novo desde a ultima rodada -> entra no incremento
     }
 }
 
@@ -758,13 +822,28 @@ foreach ($t in $store) {
     if (-not $t.done) { $t.board = Resolve-Board $t }
 }
 
+# --- snapshot incremental desta rodada --------------------------------------
+# consolidated-$ts.json = SO o incremento (novos/alterados desde a ultima rodada
+# c/ sucesso). O store (tasks.json) continua sendo gravado COMPLETO logo abaixo;
+# o cockpit le o store, nunca o snapshot. Guarda de array/vazio igual ao Write-Store.
+$consFile  = Join-Path $Processed "consolidated-$ts.json"
+$deltaJson = @($deltaItems) | ConvertTo-Json -Depth 20
+if ([string]::IsNullOrWhiteSpace($deltaJson)) { $deltaJson = "[]" }
+if ($deltaJson -notmatch '^\s*\[') { $deltaJson = "[$deltaJson]" }
+[System.IO.File]::WriteAllText($consFile, $deltaJson, $Utf8NoBom)
+$sinceLabel = if ($lastSuccessRun) { $lastSuccessRun } else { "(primeira execucao)" }
+Log ("Snapshot incremental: $consFile ($($deltaItems.Count) itens novos/alterados desde $sinceLabel)") DarkGray
+
 # --- grava (respeitando DryRun) ---------------------------------------------
 if ($DryRun) {
-    Log "DryRun: store NAO alterado. (consolidated-$ts.json gerado)" Yellow
+    Log "DryRun: store NAO alterado e marco de sucesso NAO avancado. (consolidated-$ts.json gerado)" Yellow
 }
 else {
     Write-Store $store
     Log "Store atualizado: $TasksFile" Green
+    # Rodada bem-sucedida: avanca o marco. Proxima rodada mede o incremento a partir daqui.
+    Write-LastSuccessRun $nowIso
+    Log "Marco de ultima rodada com sucesso atualizado: $nowIso" DarkGray
 }
 
 if ($InitialLoad -and $reviewItems.Count -gt 0) {
@@ -784,6 +863,7 @@ foreach ($k in $channelStatus.Keys) {
     Log ("  {0,-9}: {1}" -f $k, $v) $col
 }
 Log ("  Novas: {0} | Atualizadas: {1} | Roladas: {2} | Revisao: {3}" -f $stats.new, $stats.updated, $stats.rolled, $stats.review) Gray
+Log ("  Snapshot incremental: {0} itens novos/alterados desde {1}" -f $deltaItems.Count, $sinceLabel) Gray
 Log "=============================" Cyan
 
 # ============================================================
