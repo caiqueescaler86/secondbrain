@@ -15,6 +15,12 @@ Levante:
 Regras:
 - NÃO invente. Se faltar informação, use null.
 - "eu" = o dono da conta.
+- Inclua somente itens que envolvam Caíque diretamente ou sejam referentes a Emarsys. Ignore o restante.
+- **De quem é a bola = decida pela mensagem MAIS RECENTE do thread/chat, não pelo histórico.**
+  - Se a ÚLTIMA mensagem do thread é de outra pessoa e faz uma pergunta, pede algo ou espera ação minha → status "responder" ou "fazer", responsavel "eu". NUNCA "aguardando".
+  - Só use "aguardando"/"cobrar" quando MINHA mensagem foi a última do thread e estou genuinamente esperando retorno de alguém.
+  - Se me marcam pelo nome ou @menção pedindo algo, a bola é minha ("responder"/"fazer", eu).
+  - Reavalie a cada nova mensagem: um thread onde eu estava "aguardando" vira "responder" assim que a pessoa me responde pedindo o próximo passo.
 - status: "fazer" (ação minha), "responder", "cobrar", "aguardando", "preparar" (reunião), "risco", "referencia".
 - prioridade: "alta|media|baixa".
 - fonte: "teams", "transcricao" ou "email".

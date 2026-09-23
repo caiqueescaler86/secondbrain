@@ -148,8 +148,19 @@ elseif ($Engine -eq 'joule') { $Model = "Joule" }
 
 # --- Monta o prompt ----------------------------------------------------------
 if ($Json) {
-    # Modo estruturado: contrato JSON consumido pelo secondbrain-run.ps1.
-    $system = @"
+    # Modo estruturado: carrega instrucoes do template prompts/whatsapp.md,
+    # injetando data/hora atual (o modelo local nao conhece a data) e o periodo.
+    $waPromptFile = Join-Path $ScriptRoot "prompts\whatsapp.md"
+    if (Test-Path $waPromptFile) {
+        $hoje = (Get-Date).ToString("dd/MM/yyyy")
+        $hora = (Get-Date).ToString("HH:mm")
+        $system = (Get-Content $waPromptFile -Raw -Encoding UTF8) `
+                  -replace '\{\{HOJE\}\}', $hoje `
+                  -replace '\{\{HORA\}\}', $hora `
+                  -replace '\{\{DIAS\}\}', [string]$Days
+    } else {
+        # Fallback: instrucoes minimas caso o template nao exista.
+        $system = @"
 Voce e um extrator de pendencias de conversas de WhatsApp. Responda SOMENTE com um array JSON valido, sem texto antes/depois, sem cercas de codigo.
 Regras:
 - Linhas 'EU:' sao mensagens minhas (direction=out); as demais sao da outra pessoa.
@@ -158,11 +169,10 @@ Regras:
 - tipo: pessoal|trabalho. prioridade: alta|media|baixa.
 - Ignore conversa social sem acao.
 "@
-    $Question = @"
-Analise as conversas abaixo (ultimos $Days dias) e devolva um array JSON. Cada item:
-{"canal":"whatsapp","tipo":"pessoal|trabalho","pessoa":"","assunto":"","resumo":"","proxima_acao":"","responsavel":"eu ou nome","status":"fazer|responder|cobrar|aguardando|risco|referencia","prazo":"YYYY-MM-DD ou null","prioridade":"alta|media|baixa","risco":"texto ou null","fonte":"whatsapp","reuniao_em":null}
-Se nao houver nada relevante, devolva [].
-"@
+    }
+    # $Question vazio: o schema e instrucoes ja estao no $system (template).
+    # A linha "=== CONVERSAS ===" com os dados e acrescentada por cada lote abaixo.
+    $Question = ""
     if ($Temperature -gt 0.2) { $Temperature = 0.1 }
 }
 elseif ([string]::IsNullOrWhiteSpace($Question)) {
