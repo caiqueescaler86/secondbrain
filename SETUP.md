@@ -183,12 +183,21 @@ C:\Users\I827769\Documents\Joule\SecondBrain
 
 ```
 SecondBrain\
-├─ processed\tasks.json            ← o "banco" (store vivo)
-├─ processed\consolidated-<ts>.json← snapshot consolidado de cada rodada
-├─ processed\initial-review.json   ← itens baixa/referência da carga inicial
-├─ raw\<canal>-<ts>.txt|.json      ← saída crua de cada canal
-└─ logs\run-<ts>.log               ← log da rodada
+├─ processed\tasks.json              ← o "banco" (store vivo)
+├─ processed\consolidated-<ts>.json  ← delta incremental (novos/alterados desde o último run)
+├─ processed\consolidated-<ts>.full.json ← cópia completa de auditoria
+├─ processed\last-run.json           ← timestamp do último run bem-sucedido
+├─ processed\initial-review.json     ← itens baixa/referência da carga inicial
+├─ raw\<canal>-<ts>.txt|.json        ← saída crua de cada canal
+└─ logs\run-<ts>.log                 ← log da rodada
 ```
+
+> **Snapshots incrementais:** a partir do segundo run, `consolidated-<ts>.json` traz
+> **só o delta** — itens novos ou cujo conteúdo semântico mudou desde a última rodada.
+> O `last-run.json` também controla a **janela de busca dinâmica**: se o sistema ficou
+> parado (máquina desligada, férias), a próxima rodada detecta o gap e expande
+> automaticamente a janela enviada ao Joule/Copilot (ex.: 5 dias parado → busca 5 dias,
+> não só 24h). Tetos: Joule 14 dias, Copilot 72h, WhatsApp 14 dias.
 
 ---
 
@@ -431,7 +440,33 @@ powershell ... -File "...\whatsapp-transcribe.ps1"
 
 ---
 
-## 11. Restrições de segurança/operação (LEIA antes de operar)
+## 11. Ajustando o comportamento dos canais (prompts editáveis)
+
+Os três canais de coleta usam arquivos de texto como templates de prompt — você edita
+o arquivo e a mudança entra na próxima rodada, sem mexer em nenhum script.
+
+| Arquivo | Canal | Placeholders substituídos pelo script |
+|---|---|---|
+| `prompts\joule.md` | Joule (e-mail + calendário) | `{{JANELA}}` — janela de tempo calculada automaticamente |
+| `prompts\copilot.md` | Copilot (Teams + transcrições) | `{{JANELA}}` |
+| `prompts\whatsapp.md` | WhatsApp (LLM local) | `{{HOJE}}` (dd/MM/yyyy), `{{HORA}}` (HH:mm), `{{DIAS}}` (nº de dias da janela) |
+
+> O `{{HOJE}}` e `{{HORA}}` no WhatsApp existem porque a LLM local (llama) não tem
+> relógio — sem eles, datas relativas ("sexta", "amanhã") virariam prazo chutado.
+
+**Regras que valem nos 3 prompts e que foram cuidadosamente calibradas:**
+- *"De quem é a bola = ÚLTIMA mensagem do thread"* — evita classificar como "aguardando"
+  algo que já está esperando resposta sua.
+- Escopo: *"Inclua somente itens que envolvam Caíque diretamente ou sejam referentes a
+  Emarsys"* — descarta ruído de outras pessoas/projetos.
+
+> ⚠️ Os prompts usam **comando imperativo** (sem cabeçalho `# Prompt`) de propósito —
+> o M365 Copilot "otimiza" prompts com cabeçalho e perde o contrato JSON. Não adicione
+> cabeçalhos de seção antes das instruções do `copilot.md`.
+
+---
+
+## 12. Restrições de segurança/operação (LEIA antes de operar)
 
 - **Tudo local.** CDP do Joule (`127.0.0.1:9222`), CDP do Copilot (`127.0.0.1:9223`),
   BiDi do WhatsApp (`127.0.0.1:9224`) e o cockpit (`127.0.0.1:8787`) são **loopback**.
@@ -457,7 +492,7 @@ powershell ... -File "...\whatsapp-transcribe.ps1"
 
 ---
 
-## 12. Solução de problemas (troubleshooting)
+## 13. Solução de problemas (troubleshooting)
 
 | Sintoma | Causa provável / correção (do código) |
 |---|---|
@@ -479,7 +514,7 @@ powershell ... -File "...\whatsapp-transcribe.ps1"
 
 ---
 
-## 13. Fluxo mínimo do dia a dia
+## 14. Fluxo mínimo do dia a dia
 
 ```powershell
 # 1) deixe abertos: Joule Desktop, M365 Copilot, Firefox/WhatsApp; llama sobe no logon

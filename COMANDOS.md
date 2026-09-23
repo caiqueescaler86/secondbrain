@@ -89,13 +89,37 @@ Nada seu e aberto fica escondido num canto.
 - **"Aguardando os outros"** e **"Referência / baixa"** ficam em seções recolhíveis
   embaixo (clique no título pra abrir/fechar).
 - **Clicar no card** → expande resumo, risco, notas e os botões.
-- **Feito** → marca como concluída · **Adiar** → joga pra amanhã · **↑↓ Prio** → muda prioridade.
-- **Notas** → digita direto no card (salva ao sair do campo).
+- **✓ (canto sup. esq. do card)** → conclui em 1 clique sem expandir · confete 🎉 e elogio no toast.
+- **Feito** → mesmo efeito de dentro do card · **Adiar** → joga pra amanhã · **↑↓ Prio** → cicla prioridade.
+- **Notas** → digita direto no card (salva ao sair do campo, **sem piscar a tela**).
+- **Prazo** → campo de data no canto superior direito do card (editável sem expandir).
 - Topo: **relógio**, contadores (hoje / atrasadas / aguardando), **busca** e os toggles:
   - **"referência / baixa"** → mostra a seção de baixa prioridade/referência.
   - **"concluídas"** → mostra o que já foi feito.
+  - **prioridade / data** → alterna a ordenação do board.
+  - **⤢** → expande todos os cards visíveis de uma vez.
 - O cockpit **recarrega sozinho a cada 1 min**; `⟳` recarrega na hora.
 - Suas ações (feito, notas, prioridade) **são preservadas** na próxima rodada.
+
+### 🧠 Agente (filtro e perguntas)
+
+Botão **🧠 Agente** (canto superior direito) abre o painel de IA. Dois modos:
+
+| Alvo | Motor | Velocidade | Acesso à internet |
+|---|---|---|---|
+| **Joule** (padrão) | Claude via Joule Desktop | 30–120 s | Sim (e-mail/calendário do M365) |
+| **IA local** | llama-server :19001 | 1–3 s | Não (só o que está nos cards) |
+
+**Filtrar a tela por linguagem natural** — fala no painel e o board muda:
+- `"me traga as pendências da Cantu"` → mostra só cards da Cantu.
+- `"mostra os riscos atrasados"` → filtra status=risco + prazo vencido.
+- `"possíveis duplicados"` → detecta localmente (sem LLM), marca grupos ≈ no board.
+- `"limpar filtro"` (ou o **✕** no chip) → volta tudo.
+
+**Perguntas livres** também funcionam — ex.: `"o que é mais urgente hoje?"`, `"resume o que o cliente X pediu"`.
+
+> Verbos que ativam o filtro (detectados no browser, instantâneo): *traga, mostra, filtra, deixa só, apenas, esconde, oculta…*
+> Qualquer outra frase → pergunta normal pro modelo selecionado.
 
 ---
 
@@ -149,7 +173,11 @@ C:\Users\I827769\Documents\Joule\SecondBrain\
 ├─ secondbrain-run.ps1     ← orquestrador (entrada única)
 ├─ cockpit.ps1             ← servidor web local
 ├─ cockpit-demo.ps1        ← dados de exemplo
-├─ cockpit\                ← visual (index.html / style.css / app.js)
+├─ cockpit\                ← visual (index.html / style.css / app.js / favicon)
+├─ prompts\                ← templates de prompt editáveis pelo usuário
+│   ├─ joule.md            ← e-mail + calendário  ({{JANELA}})
+│   ├─ copilot.md          ← Teams + transcrições ({{JANELA}})
+│   └─ whatsapp.md         ← WhatsApp             ({{HOJE}} {{HORA}} {{DIAS}})
 ├─ analyze-whatsapp.ps1    ← análise do WhatsApp pela LLM local (em lotes)
 ├─ start-llama.ps1         ← sobe o llama-server local (auto-start no logon, idempotente)
 ├─ meeting-detector.ps1    ← canal: ingere transcrições de reunião → cards
@@ -158,7 +186,9 @@ C:\Users\I827769\Documents\Joule\SecondBrain\
 ├─ setup-meeting.ps1       ← setup único da gravação (NAudio + tarefa de logon)
 ├─ lib\NAudio.dll          ← captura de áudio (baixada pelo setup, sem admin)
 ├─ Meetings\               ← transcrições das reuniões (.txt/.json)
-├─ processed\tasks.json    ← suas tarefas (o "banco" local)
+├─ processed\
+│   ├─ tasks.json          ← suas tarefas (o "banco" local)
+│   └─ last-run.json       ← timestamp do último run bem-sucedido (controla janela de busca)
 ├─ raw\                    ← saída crua de cada canal por rodada
 └─ logs\                   ← run-<data>.log de cada rodada
 ```
