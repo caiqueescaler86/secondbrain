@@ -340,6 +340,9 @@ function Invoke-JsonWithRetry([scriptblock]$Block, [int]$Tries = 2, [int]$WaitSe
 
 # ============================================================
 # JANELAS
+# Se houver um run anterior com sucesso, expande a janela para cobrir o gap
+# (ex.: computador ficou desligado 2 dias -> busca 48h em vez de 24h).
+# Tetos: Joule 14 dias, Copilot 72h, WhatsApp 14 dias (evita sobrecarga).
 # ============================================================
 if ($InitialLoad) {
     $jouleWindow   = "os ultimos 14 dias (e-mails) e o proximo dia util (calendario)"
@@ -348,10 +351,26 @@ if ($InitialLoad) {
     $meetingAhead  = 7
 }
 else {
-    $jouleWindow   = "os ultimos 3 dias (e-mails) e o proximo dia util (calendario)"
-    $copilotWindow = "as ultimas 24 horas (Teams, transcricoes e e-mails)"
-    $waDays        = 2
+    # Calcula gap real desde o ultimo run bem-sucedido.
+    if ($lastSuccessRun) {
+        try {
+            $gapHours = [int]([datetime]::UtcNow - [datetime]::Parse($lastSuccessRun)).TotalHours
+        } catch { $gapHours = 24 }
+    } else { $gapHours = 24 }
+
+    $jouleHours    = [math]::Min([math]::Max(72,  $gapHours), 14 * 24)
+    $copilotHours  = [math]::Min([math]::Max(24,  $gapHours), 72)
+    $waDaysGap     = [math]::Min([math]::Max(2,   [math]::Ceiling($gapHours / 24)), 14)
+    $jouleDays     = [math]::Ceiling($jouleHours / 24)
+
+    $jouleWindow   = "os ultimos $jouleDays dias (e-mails) e o proximo dia util (calendario)"
+    $copilotWindow = "as ultimas $copilotHours horas (Teams, transcricoes e e-mails)"
+    $waDays        = $waDaysGap
     $meetingAhead  = 1
+
+    if ($gapHours -gt 25) {
+        Log ("Gap desde ultimo run: ${gapHours}h -> janela expandida: Joule=${jouleDays}d Copilot=${copilotHours}h WA=${waDaysGap}d") Yellow
+    }
 }
 
 $channelStatus = [ordered]@{}
