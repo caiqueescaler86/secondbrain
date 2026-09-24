@@ -61,3 +61,29 @@ elseif ((Test-Path $Exe) -and (Test-Path $Model)) {
 else {
     Log "[X] nem launcher ($Launcher) nem exe/modelo encontrados. Nada feito."
 }
+
+
+
+# ============================================================
+# VOICE LISTENER (Jarvis) - idempotente, igual ao llama
+# ============================================================
+$VoiceDir = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "voice"
+$VenvPyw  = Join-Path $VoiceDir ".venv\Scripts\pythonw.exe"
+$ListenPy = Join-Path $VoiceDir "voice_listen.py"
+
+if (-not (Test-Path $VenvPyw) -or -not (Test-Path $ListenPy)) {
+    Log "Voice listener: venv ou voice_listen.py ausente - rode setup-voice.ps1 primeiro."
+}
+else {
+    # Ja esta rodando?
+    $voiceProc = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.CommandLine -like "*voice_listen.py*" }
+    if ($voiceProc) {
+        Log "Voice listener ja em execucao (PID $($voiceProc.ProcessId)) -> nada a fazer."
+    }
+    else {
+        Log "Subindo voice listener (Jarvis)..."
+        Start-Process -FilePath $VenvPyw -ArgumentList $ListenPy -WorkingDirectory $VoiceDir -WindowStyle Hidden
+        Log "Voice listener iniciado (Ctrl+Shift+B + hey jarvis)."
+    }
+}

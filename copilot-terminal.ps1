@@ -1,6 +1,6 @@
 param(
     [string]$Prompt,
-    [int]$TimeoutSec = 120,
+    [int]$TimeoutSec = 600,
     [string]$Model = "GPT 5.6 Think"   # modelo alvo no seletor do Copilot; "" = nao mexe
 )
 
@@ -83,7 +83,27 @@ function Start-CopilotBridge {
     # suspenso (appstate=suspended na URL do target), caso em que o WebView congela
     # e qualquer tentativa de interacao falha silenciosamente. Precisa relançar.
     if (Test-CopilotCDP -and -not (Test-CopilotSuspended)) {
-        return
+        # CDP vivo e nao suspenso, mas a janela pode estar oculta/minimizada.
+        # Com janela oculta o WebView2 throttla timers e a resposta nunca chega.
+        # ShowWindow(SW_RESTORE=9) restaura ao nivel do OS; se nao houver janela
+        # (MainWindowHandle=0, app no tray sem renderer), cai no relaunch abaixo.
+        $_proc = @(Get-Process M365Copilot -ErrorAction SilentlyContinue) | Select-Object -First 1
+        $_hwnd = if ($_proc) { $_proc.MainWindowHandle } else { [IntPtr]::Zero }
+        if ($_hwnd -ne [IntPtr]::Zero) {
+            if (-not ([Management.Automation.PSTypeName]'SbWin32').Type) {
+                Add-Type -TypeDefinition '
+                    using System; using System.Runtime.InteropServices;
+                    public class SbWin32 {
+                        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+                        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+                    }' -ErrorAction SilentlyContinue
+            }
+            try { [SbWin32]::ShowWindow($_hwnd, 9) | Out-Null } catch {}
+            try { [SbWin32]::SetForegroundWindow($_hwnd) | Out-Null } catch {}
+            Start-Sleep -Milliseconds 500
+            return
+        }
+        # MainWindowHandle = 0: app no tray sem janela - cai no relaunch abaixo.
     }
 
     # Suspenso ou sem porta: mata e relanca.
@@ -188,6 +208,7 @@ function Open-CopilotSession {
                     try { Send-CDP "Emulation.setFocusEmulationEnabled" @{ enabled = $true } | Out-Null } catch {}
                     try { Send-CDP "Page.enable" @{} | Out-Null } catch {}
                     try { Send-CDP "Page.setWebLifecycleState" @{ state = "active" } | Out-Null } catch {}
+                    try { Send-CDP "Page.bringToFront" @{} | Out-Null } catch {}
                     return
                 }
 
@@ -402,7 +423,7 @@ function Ask-Copilot {
         [Parameter(Position = 0)]
         [string]$Prompt,
 
-        [int]$TimeoutSec = 120
+        [int]$TimeoutSec = 600
     )
 
     if ([string]::IsNullOrWhiteSpace($Prompt)) {
@@ -438,7 +459,7 @@ function Invoke-CopilotAsk {
         [Parameter(Position = 0)]
         [string]$Prompt,
 
-        [int]$TimeoutSec = 120
+        [int]$TimeoutSec = 600
     )
 
     Open-CopilotSession -TimeoutSec ($TimeoutSec + 60)
@@ -470,6 +491,12 @@ function Invoke-CopilotAsk {
         }
 
         # 2) Clique REAL de mouse para focar o editor (foco confiavel).
+        # Antes, traz a janela pra frente: os Input.dispatchMouseEvent abaixo
+        # (foco e clique no Send) so "pegam" de forma confiavel com a page ativa/
+        # em primeiro plano. Com a janela atras, o clique no Send nao registrava e
+        # a geracao nao iniciava (editor preenchido, sem resposta). Best-effort.
+        try { Send-CDP "Page.bringToFront" @{} | Out-Null } catch {}
+        try { Send-CDP "Page.setWebLifecycleState" @{ state = "active" } | Out-Null } catch {}
         Send-CDP "Input.dispatchMouseEvent" @{ type="mousePressed";  x=[int]$p.x; y=[int]$p.y; button="left"; clickCount=1 } | Out-Null
         Send-CDP "Input.dispatchMouseEvent" @{ type="mouseReleased"; x=[int]$p.x; y=[int]$p.y; button="left"; clickCount=1 } | Out-Null
         Start-Sleep -Milliseconds 250
@@ -494,36 +521,15 @@ function Invoke-CopilotAsk {
             throw "Nao consegui inserir o texto no editor do Copilot."
         }
 
-        # 6) Envia. No chat recem-carregado (pos-relaunch) o handler de Enter as
-        # vezes ainda nao esta pronto e a mensagem fica digitada sem enviar. O
-        # clique REAL no botao Send (aria-label="Send") e confiavel; Enter fica
-        # como fallback se o botao nao aparecer.
-        $sendBtn = Send-CDP "Runtime.evaluate" @{
-            returnByValue = $true
-            expression = @'
-(() => {
-  const b = document.querySelector('button[aria-label="Send"]') || document.querySelector('button[aria-label="Enviar"]');
-  if (!b || b.disabled) return JSON.stringify({ok:false});
-  const r = b.getBoundingClientRect();
-  return JSON.stringify({ok:true, x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2)});
-})()
-'@
-        }
-        $sb = $null
-        try { $sb = $sendBtn | ConvertFrom-Json } catch {}
-
-        if ($sb -and $sb.ok) {
-            Send-CDP "Input.dispatchMouseEvent" @{ type="mousePressed";  x=[int]$sb.x; y=[int]$sb.y; button="left"; clickCount=1 } | Out-Null
-            Send-CDP "Input.dispatchMouseEvent" @{ type="mouseReleased"; x=[int]$sb.x; y=[int]$sb.y; button="left"; clickCount=1 } | Out-Null
-        } else {
-            Send-CDP "Input.dispatchKeyEvent" @{ type="keyDown"; key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
-            Send-CDP "Input.dispatchKeyEvent" @{ type="keyUp";   key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
-        }
+        # 6) Envia. Enter e o metodo primario: o editor ja tem foco (passo 2)
+        # e o Input.dispatchKeyEvent nao depende de coordenadas nem de window
+        # state. O clique no botao Send fica como fallback caso o Enter nao
+        # dispare a geracao (ex.: chat pos-relaunch com handler ainda nao pronto).
+        Send-CDP "Input.dispatchKeyEvent" @{ type="keyDown"; key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
+        Send-CDP "Input.dispatchKeyEvent" @{ type="keyUp";   key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
 
         # 6b) Confirma que a GERACAO COMECOU (botao Stop aparece). Se em ~10s nao
-        # apareceu, o Send nao pegou (editor ainda com texto): reenvia UMA vez
-        # (clique no Send de novo, senao Enter). Isso mata o modo de falha em que
-        # o texto ficava digitado e a rodada dava timeout sem resposta nenhuma.
+        # apareceu, o Enter nao pegou: tenta o clique real no botao Send.
         $genStarted = $false
         $startDeadline = (Get-Date).AddSeconds(10)
         do {
@@ -535,7 +541,7 @@ function Invoke-CopilotAsk {
         } while (-not $genStarted -and (Get-Date) -lt $startDeadline)
 
         if (-not $genStarted) {
-            # Reenvio: acha o Send de novo e clica; fallback Enter.
+            # Fallback: clique real no botao Send via coordenadas.
             $sendBtn2 = Send-CDP "Runtime.evaluate" @{
                 returnByValue = $true
                 expression = @'
@@ -553,6 +559,7 @@ function Invoke-CopilotAsk {
                 Send-CDP "Input.dispatchMouseEvent" @{ type="mousePressed";  x=[int]$sb2.x; y=[int]$sb2.y; button="left"; clickCount=1 } | Out-Null
                 Send-CDP "Input.dispatchMouseEvent" @{ type="mouseReleased"; x=[int]$sb2.x; y=[int]$sb2.y; button="left"; clickCount=1 } | Out-Null
             } else {
+                # Ultimo recurso: Enter de novo (pode ter perdido o foco).
                 Send-CDP "Input.dispatchKeyEvent" @{ type="keyDown"; key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
                 Send-CDP "Input.dispatchKeyEvent" @{ type="keyUp";   key="Enter"; code="Enter"; windowsVirtualKeyCode=13; nativeVirtualKeyCode=13 } | Out-Null
             }

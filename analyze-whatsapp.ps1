@@ -9,6 +9,7 @@ param(
     [int]$ChunkChars = 7000,
     [string]$Question = "",
     [string]$OnlyChat = "",
+    [string]$SinceIso = "",
     [double]$Temperature = 0.3,
     [int]$MaxTokens = 1500,
     [int]$TimeoutSec = 900,
@@ -62,7 +63,17 @@ if (-not (Test-Path $MessagesFile)) {
 
 # --- Carrega e filtra as mensagens ------------------------------------------
 $cutoff = (Get-Date).AddDays(-$Days)
-Log "Lendo base e filtrando ultimos $Days dias (a partir de $($cutoff.ToString('yyyy-MM-dd HH:mm')))..." Cyan
+
+# Marca d'agua: se informado, descarta mensagens cujo instante de envio e anterior/igual
+# ao ultimo instante de analise bem-sucedida (evita realimentar mensagens ja processadas).
+$sinceOffset = $null
+if (-not [string]::IsNullOrWhiteSpace($SinceIso)) {
+    try { $sinceOffset = [datetimeoffset]::Parse($SinceIso) } catch {}
+    if (-not $sinceOffset) { Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] AVISO: -SinceIso '$SinceIso' nao foi parseado; ignorando." -ForegroundColor Yellow }
+}
+
+$sinceLabel = if ($sinceOffset) { " | marca dagua: desde $($sinceOffset.ToString('yyyy-MM-dd HH:mm zzz'))" } else { "" }
+Log "Lendo base e filtrando ultimos $Days dias (a partir de $($cutoff.ToString('yyyy-MM-dd HH:mm')))$sinceLabel..." Cyan
 
 $records = New-Object System.Collections.ArrayList
 $total = 0
@@ -74,8 +85,11 @@ foreach ($line in [System.IO.File]::ReadLines($MessagesFile)) {
 
     if (-not $r.timestamp) { continue }
     $dt = $null
-    try { $dt = [datetimeoffset]::Parse([string]$r.timestamp) } catch { continue }
+    try { $dt = [datetimeoffset]::Parse([string]$r.timestamp) } catch {}
+    if (-not $dt) { continue }
     if ($dt.LocalDateTime -lt $cutoff) { continue }
+    # Marca d'agua: descarta mensagens ja processadas na ultima analise bem-sucedida.
+    if ($sinceOffset -and $dt -le $sinceOffset) { continue }
 
     if ($OnlyChat -and ([string]$r.chat) -notlike "*$OnlyChat*") { continue }
     if ([string]::IsNullOrWhiteSpace([string]$r.text)) { continue }

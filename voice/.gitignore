@@ -1,0 +1,6 @@
+# Artefatos gerados pelo setup-voice.ps1 / execução — não versionar.
+.venv/
+__pycache__/
+*.pyc
+config.json
+voice.log

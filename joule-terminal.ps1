@@ -2,7 +2,7 @@ param(
     [string]$Prompt,
     [string]$PromptFile,
     [switch]$NewThread,
-    [int]$TimeoutSec = 120
+    [int]$TimeoutSec = 600
 )
 
 # Saida em UTF-8. Quando o cockpit roda este script via Start-Process
@@ -70,9 +70,33 @@ function Get-JouleTarget {
 }
 
 
-# ============================================================
-# GARANTE QUE JOULE ESTA RODANDO COM CDP LOCAL
-# ============================================================
+# Sonda se a API de chat do Joule JA carregou no renderer. No cold-start o alvo
+# (page) aparece no /json/list antes de window.api.chat existir e antes da
+# sessao/gateway estar pronta: se perguntarmos nesse instante, o send e aceito
+# mas nenhum evento volta -> 4 min de "Timeout esperando resposta". Best-effort.
+function Test-JouleChatApiReady([string]$WsUrl) {
+    $ws  = [System.Net.WebSockets.ClientWebSocket]::new()
+    $cts = [System.Threading.CancellationTokenSource]::new()
+    $cts.CancelAfter([TimeSpan]::FromSeconds(6))
+    try {
+        $ws.ConnectAsync([Uri]$WsUrl, $cts.Token).GetAwaiter().GetResult() | Out-Null
+        $req = @{ id = 1; method = "Runtime.evaluate"; params = @{
+            expression = "(typeof (window.api && window.api.chat && window.api.chat.send) === 'function')"
+            returnByValue = $true
+        } } | ConvertTo-Json -Compress -Depth 10
+        $b = [Text.Encoding]::UTF8.GetBytes($req)
+        $ws.SendAsync([ArraySegment[byte]]::new($b), [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).GetAwaiter().GetResult() | Out-Null
+        $buf = New-Object byte[] 8192
+        $r = $ws.ReceiveAsync([ArraySegment[byte]]::new($buf), $cts.Token).GetAwaiter().GetResult()
+        $resp = [Text.Encoding]::UTF8.GetString($buf, 0, $r.Count)
+        return ($resp -match '"value"\s*:\s*true')
+    }
+    catch { return $false }
+    finally {
+        try { $ws.Dispose() } catch {}
+        try { $cts.Dispose() } catch {}
+    }
+}
 
 function Start-JouleBridge {
 
@@ -166,6 +190,8 @@ function Start-JouleBridge {
     # Espera o renderer aparecer
     $deadline = (Get-Date).AddSeconds(30)
 
+    $target = $null
+
     do {
 
         Start-Sleep -Milliseconds 400
@@ -173,13 +199,40 @@ function Start-JouleBridge {
         $target = Get-JouleTarget
 
         if ($target) {
-            return $target
+            break
         }
 
     } while ((Get-Date) -lt $deadline)
 
 
-    throw "O Joule abriu, mas o renderer nao apareceu."
+    if (-not $target) {
+        throw "O Joule abriu, mas o renderer nao apareceu."
+    }
+
+
+    # COLD-START: o alvo (page) aparece no /json/list ANTES de window.api.chat
+    # existir e ANTES da sessao/gateway ficar pronta. Se perguntarmos nesse
+    # instante, o send e aceito mas nenhum evento volta -> "Timeout esperando
+    # resposta" (foi a falha das 08:52). Espera a API de chat existir + um settle
+    # pro gateway-auth/config assentar. So no cold-start (o reuso la em cima
+    # retorna direto e continua rapido).
+    $apiDeadline = (Get-Date).AddSeconds(30)
+
+    while ((Get-Date) -lt $apiDeadline) {
+
+        if (Test-JouleChatApiReady $target.webSocketDebuggerUrl) {
+            break
+        }
+
+        Start-Sleep -Milliseconds 700
+    }
+
+    # Gateway/auth do Joule leva mais tempo que a API surgir no DOM.
+    # 8s era insuficiente: cold-start aceita o send() mas nao entrega onEvent
+    # porque o backend SAP ainda nao autenticou. 30s cobre a autenticacao.
+    Start-Sleep -Seconds 30
+
+    return $target
 }
 
 
@@ -193,7 +246,7 @@ function Invoke-JouleCDP {
         [Parameter(Mandatory)]
         [string]$Expression,
 
-        [int]$TimeoutSec = 135
+        [int]$TimeoutSec = 615
     )
 
 
@@ -226,7 +279,8 @@ function Invoke-JouleCDP {
         $prelude = @(
             @{ id = 1; method = "Page.enable"; params = @{} },
             @{ id = 2; method = "Page.setWebLifecycleState"; params = @{ state = "active" } },
-            @{ id = 3; method = "Emulation.setFocusEmulationEnabled"; params = @{ enabled = $true } }
+            @{ id = 3; method = "Emulation.setFocusEmulationEnabled"; params = @{ enabled = $true } },
+            @{ id = 4; method = "Page.bringToFront"; params = @{} }
         )
         foreach ($cmd in $prelude) {
             try {
@@ -379,7 +433,7 @@ function Ask-Joule {
 
         [switch]$NewThread,
 
-        [int]$TimeoutSec = 120
+        [int]$TimeoutSec = 600
     )
 
 

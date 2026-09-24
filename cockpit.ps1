@@ -134,7 +134,6 @@ function Get-ManualPrefix([string]$status) {
 
 function Resolve-ManualBoard([string]$categoria, [string]$prioridade) {
     if ($categoria -eq "referencia") { return "referencia" }
-    if ($prioridade -eq "baixa")     { return "review" }
     return "active"
 }
 
@@ -193,24 +192,20 @@ function Handle-GetTasks($ctx) {
     Send-Json $ctx 200 @($tasks)
 }
 
-function Handle-CreateTask($ctx) {
-    $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [Text.Encoding]::UTF8)
-    $body = $reader.ReadToEnd()
-    $reader.Close()
+# --- cerebro compartilhado: cria uma tarefa a partir de campos ja estruturados.
+# Usado por /api/task (modal) e por /api/capture (voz/agente). Retorna
+# @{ code = 201|400|409; task=...; error=... } (o chamador faz Send-Json).
+function New-ManualTask($fields, [string]$origem = "manual") {
+    $assunto = ("" + $fields.assunto).Trim()
+    if (-not $assunto) { return @{ code = 400; error = "assunto obrigatorio" } }
 
-    $in = $null
-    try { $in = $body | ConvertFrom-Json } catch { Send-Json $ctx 400 @{ error = "JSON invalido" }; return }
-
-    $assunto = ("" + $in.assunto).Trim()
-    if (-not $assunto) { Send-Json $ctx 400 @{ error = "assunto obrigatorio" }; return }
-
-    $pessoa       = ("" + $in.pessoa).Trim()
-    $status       = ("" + $in.status).Trim();     if (-not $status) { $status = "fazer" }
-    $prioridade   = ("" + $in.prioridade).Trim(); if (-not $prioridade) { $prioridade = "media" }
-    $proxima_acao = ("" + $in.proxima_acao).Trim()
-    $notas        = ("" + $in.notas).Trim()
-    $resumo       = ("" + $in.resumo).Trim()
-    $dueDate      = ("" + $in.dueDate).Trim()
+    $pessoa       = ("" + $fields.pessoa).Trim()
+    $status       = ("" + $fields.status).Trim();     if (-not $status) { $status = "fazer" }
+    $prioridade   = ("" + $fields.prioridade).Trim(); if (-not $prioridade) { $prioridade = "media" }
+    $proxima_acao = ("" + $fields.proxima_acao).Trim()
+    $notas        = ("" + $fields.notas).Trim()
+    $resumo       = ("" + $fields.resumo).Trim()
+    $dueDate      = ("" + $fields.dueDate).Trim()
     if ($dueDate) {
         try { $dueDate = ([datetime]::Parse($dueDate)).ToString("yyyy-MM-dd") } catch { $dueDate = $null }
     } else { $dueDate = $null }
@@ -222,8 +217,8 @@ function Handle-CreateTask($ctx) {
     $nowIso    = (Get-Date).ToString("o")
 
     $tasks = Read-Tasks
-    $existing = $tasks | Where-Object { $_.sbid -eq $sbid } | Select-Object -First 1
-    if ($existing) { Send-Json $ctx 409 @{ error = "Ja existe uma tarefa com essa pessoa+assunto"; task = $existing }; return }
+    $existing = $tasks | Where-Object { $_.sbid -eq $sbid -and -not $_.done } | Select-Object -First 1
+    if ($existing) { return @{ code = 409; error = "Ja existe uma tarefa com essa pessoa+assunto"; task = $existing } }
 
     $titulo = if ($pessoa) { "$pessoa - $assunto" } else { $assunto }
 
@@ -232,7 +227,7 @@ function Handle-CreateTask($ctx) {
         titulo       = $titulo
         prefixo      = $prefixo
         canal        = "manual"
-        fontes       = @("manual")
+        fontes       = @($origem)
         pessoa       = $pessoa
         assunto      = $assunto
         resumo       = $resumo
@@ -253,12 +248,37 @@ function Handle-CreateTask($ctx) {
         userTouched  = $nowIso
         createdAt    = $nowIso
         updatedAt    = $nowIso
-        history      = @("[$nowIso] criado (manual)")
+        history      = @("[$nowIso] criado ($origem)")
     }
 
     $tasks = @($tasks) + @($new)
     Write-Tasks $tasks
-    Send-Json $ctx 201 $new
+    return @{ code = 201; task = $new }
+}
+
+function Handle-CreateTask($ctx) {
+    $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [Text.Encoding]::UTF8)
+    $body = $reader.ReadToEnd()
+    $reader.Close()
+
+    $in = $null
+    try { $in = $body | ConvertFrom-Json } catch { Send-Json $ctx 400 @{ error = "JSON invalido" }; return }
+
+    $origem = ("" + $in.origem).Trim(); if (-not $origem) { $origem = "manual" }
+    $fields = @{
+        assunto      = $in.assunto
+        pessoa       = $in.pessoa
+        status       = $in.status
+        prioridade   = $in.prioridade
+        proxima_acao = $in.proxima_acao
+        notas        = $in.notas
+        resumo       = $in.resumo
+        dueDate      = $in.dueDate
+    }
+    $r = New-ManualTask $fields $origem
+    if ($r.code -eq 201)     { Send-Json $ctx 201 $r.task }
+    elseif ($r.code -eq 409) { Send-Json $ctx 409 @{ error = $r.error; task = $r.task } }
+    else                     { Send-Json $ctx 400 @{ error = $r.error } }
 }
 
 function Handle-PostTask($ctx, [string]$sbid) {

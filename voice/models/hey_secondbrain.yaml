@@ -1,0 +1,59 @@
+
+model_name: "hey_secondbrain"
+
+target_phrase:
+  - "hey second brain"
+
+custom_negative_phrases:
+  - "second brain"
+  - "the second brain"
+  - "my second brain"
+  - "hey second"
+  - "hey brain"
+  - "second brand"
+  - "second train"
+
+n_samples: 75000
+n_samples_val: 7500
+
+tts_batch_size: 50
+augmentation_batch_size: 16
+
+augmentation_rounds: 2
+
+piper_sample_generator_path: "/tmp/secondbrain/piper-sample-generator"
+
+output_dir: "/tmp/secondbrain/hey_secondbrain_model"
+
+rir_paths:
+  - "/tmp/secondbrain/mit_rirs"
+
+background_paths:
+  - "/tmp/secondbrain/audioset_16k"
+  - "/tmp/secondbrain/fma"
+
+background_paths_duplication_rate:
+  - 1
+  - 1
+
+false_positive_validation_data_path:
+  "/tmp/secondbrain/validation_set_features.npy"
+
+feature_data_files:
+  "ACAV100M_sample":
+    "/tmp/secondbrain/openwakeword_features_ACAV100M_2000_hrs_16bit.npy"
+
+batch_n_per_class:
+  "ACAV100M_sample": 1024
+  "adversarial_negative": 50
+  "positive": 50
+
+model_type: "dnn"
+
+layer_size: 32
+
+steps: 50000
+
+max_negative_weight: 1500
+
+target_false_positives_per_hour: 0.2

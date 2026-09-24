@@ -116,12 +116,20 @@ C:\Users\I827769\Documents\Joule\SecondBrain
    powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\Joule\SecondBrain\setup-meeting.ps1"
    ```
 
-7. **Crie os comandos do dia a dia** no seu `$PROFILE` (§6) e **recarregue**:
+7. **Setup de voz** (uma vez, opcional) — cria o ambiente Python isolado, instala as
+   libs, baixa o modelo "hey jarvis", resolve o whisper e cria o auto-start do listener:
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\Joule\SecondBrain\setup-voice.ps1"
+   ```
+   Depois, os gatilhos são **Ctrl+Shift+B** e a wake word **"hey jarvis"**. O listener
+   roda **no seu processo** (por isso o whisper não esbarra na ACE Deny). Veja §9.1.
+
+8. **Crie os comandos do dia a dia** no seu `$PROFILE` (§6) e **recarregue**:
    ```powershell
    . $PROFILE
    ```
 
-8. **(Opcional) Agende a rodada diária** (§8).
+9. **(Opcional) Agende a rodada diária** (§8).
 
 ---
 
@@ -400,6 +408,36 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\
 
 > **Consentimento é sua responsabilidade:** avise os participantes e respeite a
 > política da empresa. A janela "Gravando" existe para nunca ser silencioso.
+
+### 9.1 Captura por voz ("Jarvis" — `voice\voice_listen.py`)
+
+Captura um pedido falado e cria um card, **sem parar o que você está fazendo**. Roda
+como um listener sempre ativo **no seu processo** (atalho de logon) — é por isso que o
+whisper funciona aqui, ao contrário de dentro do Claude (ACE Deny).
+
+- **Gatilhos** (os dois valem): **Ctrl+Shift+B** (hotkey global via `pynput`) e a
+  **wake word "hey jarvis"** (openWakeWord ouvindo o mic em frames 16 kHz).
+- **Fluxo:** gatilho → janela **"● Ouvindo (local)"** (consentimento, always-on-top) →
+  grava mic 16 kHz mono → **VAD por energia** encerra após **~2s de silêncio** (teto
+  ~20s) → `whisper-cli.exe` local transcreve (pt) → extrai `{assunto, pessoa, prazo,
+  status, prioridade, notas}` via **llama local** (mesmo template `prompts/criar-tarefa.md`
+  do agente digitado) → `POST /api/task` com `origem="voz"`.
+- **Nada vaza:** captura local, whisper local, cockpit local; o microfone é **sempre
+  liberado ao fim** (teardown garantido). Se o llama estiver fora do ar, o card é criado
+  com o **texto cru** como assunto — a captura nunca se perde.
+- **Whisper local do projeto:** o `setup-voice.ps1` prefere
+  `SecondBrain\whisper\Release\whisper-cli.exe` (evita o Deny do `C:\`); cai para
+  `C:\whisper` se não achar. Os caminhos resolvidos ficam em `voice\config.json`.
+- **Degradação:** se o modelo de wake word não baixar (proxy/GPO), o listener segue
+  **só com Ctrl+Shift+B**. Diagnóstico em `voice\voice.log`.
+
+Ligar o listener agora (sem deslogar):
+```powershell
+Start-Process "C:\Users\I827769\Documents\Joule\SecondBrain\voice\.venv\Scripts\pythonw.exe" -ArgumentList '"C:\Users\I827769\Documents\Joule\SecondBrain\voice\voice_listen.py"'
+```
+
+> **Instância única:** o listener usa um mutex nomeado — abrir uma segunda instância
+> apenas sai (não disputa o microfone com a primeira).
 
 ---
 

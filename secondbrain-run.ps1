@@ -104,13 +104,59 @@ function Test-TcpPort([string]$AppHost, [int]$AppPort, [int]$TimeoutMs = 800) {
     } catch { return $false }
 }
 
-Log "Preflight: conferindo apps dos canais (abre sozinho se estiver fechado)..." Cyan
+# Sonda REAL de renderer CDP. Test-TcpPort so diz que a porta escuta -> um app
+# com WebView suspensa / ws morto passa como "aberto" e o canal falha depois
+# ("remote party closed the WebSocket"). Aqui a gente ABRE o ws do alvo e faz um
+# Runtime.evaluate 1+1: se responde, esta VIVO; se a porta escuta mas nao ha
+# alvo ou o ws nao responde, e ZUMBI; se a porta nem escuta, esta FECHADO.
+# Retorna: "vivo" | "zumbi" | "fechado". (Identificacao apenas; nao mata nada.)
+function Test-CdpRenderer([int]$Port, [string]$TitleLike, [int]$TimeoutMs = 4000) {
+    if (-not (Test-TcpPort '127.0.0.1' $Port 500)) { return "fechado" }
+    try {
+        $list = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/list" -TimeoutSec 3
+    } catch { return "zumbi" }   # porta escuta mas o DevTools nao lista -> morto
+    $tgt = $list | Where-Object {
+        $_.type -eq "page" -and $_.webSocketDebuggerUrl -and
+        ($_.title -like $TitleLike -or $_.url -like "file:///*")
+    } | Select-Object -First 1
+    if (-not $tgt) { return "zumbi" }   # porta escuta, sem renderer -> suspenso/carregando
+    $ws  = New-Object System.Net.WebSockets.ClientWebSocket
+    $cts = New-Object System.Threading.CancellationTokenSource
+    $cts.CancelAfter($TimeoutMs)
+    try {
+        $ws.ConnectAsync([Uri]$tgt.webSocketDebuggerUrl, $cts.Token).GetAwaiter().GetResult()
+        $payload = '{"id":1,"method":"Runtime.evaluate","params":{"expression":"1+1","returnByValue":true}}'
+        $out = New-Object System.ArraySegment[byte] (,[Text.Encoding]::UTF8.GetBytes($payload))
+        $ws.SendAsync($out, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).GetAwaiter().GetResult()
+        $buf = New-Object byte[] 8192
+        $inn = New-Object System.ArraySegment[byte] (,$buf)
+        $res = $ws.ReceiveAsync($inn, $cts.Token).GetAwaiter().GetResult()
+        $resp = [Text.Encoding]::UTF8.GetString($buf, 0, $res.Count)
+        if ($resp -match '"id"\s*:\s*1' -and $resp -match '"result"') { return "vivo" }
+        return "zumbi"
+    }
+    catch { return "zumbi" }   # ws recusado/timeout/fechado no meio -> morto
+    finally {
+        try { $ws.Dispose() } catch {}
+        try { $cts.Dispose() } catch {}
+    }
+}
 
 # --- Joule Desktop (CDP :9222) -----------------------------------------------
 if (-not $SkipJoule) {
-    if (Test-TcpPort '127.0.0.1' 9222) {
-        Log "  Joule Desktop: JA ABERTO (:9222)." Green
-    } else {
+    $jouleState = Test-CdpRenderer 9222 "*Joule*"
+    if ($jouleState -eq "vivo") {
+        Log "  Joule Desktop: alvo CDP VIVO (:9222)." Green
+    }
+    elseif ($jouleState -eq "zumbi") {
+        # IDENTIFICACAO (nao mata ainda, a pedido): porta aberta mas o renderer
+        # nao respondeu ao ping CDP. Hoje o Start-JouleBridge reusa esse alvo e
+        # pode falhar. Se este aviso aparecer junto de "Joule FALHOU", e sinal de
+        # que matar+relancar aqui resolveria. Ver memoria secondbrain-cdp-zombie-preflight.
+        Log "  Joule Desktop: ZUMBI (:9222 escuta, mas renderer NAO responde ao ping CDP). Avaliar matar+relancar." DarkYellow
+    }
+    else {
+        # fechado: sobe limpo com CDP (comportamento antigo).
         $jouleExe = Join-Path $env:LOCALAPPDATA "Programs\Joule Desktop\Joule Desktop.exe"
         $jouleProc = Get-Process -Name "Joule Desktop" -ErrorAction SilentlyContinue
         if ($jouleProc -and $jouleProc[0].Path) { $jouleExe = $jouleProc[0].Path }
@@ -162,12 +208,17 @@ if (-not $SkipWhatsApp) {
 
 # --- Microsoft 365 Copilot (CDP :9223) ---------------------------------------
 # NAO abrimos aqui de proposito: o bridge do copilot-terminal.ps1 MATA e
-# relanca o M365Copilot pra conseguir a porta de debug; abrir antes so seria
-# desperdicado. So logamos o estado.
+# relanca o M365Copilot pra conseguir a porta de debug. So identificamos o
+# estado real (Test-CopilotSuspended do bridge ja trata o zumbi relancando).
 if (-not $SkipCopilot) {
-    if (Test-TcpPort '127.0.0.1' 9223) {
-        Log "  Copilot Desktop: JA ABERTO com CDP (:9223)." Green
-    } else {
+    $copState = Test-CdpRenderer 9223 "*Copilot*"
+    if ($copState -eq "vivo") {
+        Log "  Copilot Desktop: alvo CDP VIVO (:9223)." Green
+    }
+    elseif ($copState -eq "zumbi") {
+        Log "  Copilot Desktop: ZUMBI (:9223 escuta, renderer NAO responde ao ping CDP); o canal relanca sozinho." Yellow
+    }
+    else {
         Log "  Copilot Desktop: sem CDP; o canal Copilot abre/relanca sozinho (pode demorar ~30s)." Yellow
     }
 }
@@ -339,38 +390,93 @@ function Invoke-JsonWithRetry([scriptblock]$Block, [int]$Tries = 2, [int]$WaitSe
 }
 
 # ============================================================
-# JANELAS
-# Se houver um run anterior com sucesso, expande a janela para cobrir o gap
-# (ex.: computador ficou desligado 2 dias -> busca 48h em vez de 24h).
-# Tetos: Joule 14 dias, Copilot 72h, WhatsApp 14 dias (evita sobrecarga).
+# JANELAS (por canal, baseadas SO no delta desde o ultimo sucesso DAQUELE
+# canal). Rodando de 6/6h, cada canal olha ~6h (nao 3 dias): nao reprocessa
+# itens ja vistos e nao gera cards duplicados no board. Canal que falhou NAO
+# avanca seu marco -> no proximo run ele cobre o buraco dele, sem afetar os
+# outros. Tetos (Joule 14d, Copilot 14d, WhatsApp 14d) evitam sobrecarga.
 # ============================================================
+
+# Le o last-run.json uma vez aqui (o marco por canal precisa estar disponivel
+# ANTES das chamadas). O $lastSuccessRun global segue sendo relido mais abaixo
+# pro snapshot incremental.
+$lastRunData = $null
+if (Test-Path $LastRunFile) {
+    try {
+        $raw = [System.IO.File]::ReadAllText($LastRunFile, [Text.Encoding]::UTF8)
+        if (-not [string]::IsNullOrWhiteSpace($raw)) { $lastRunData = $raw | ConvertFrom-Json }
+    } catch { $lastRunData = $null }
+}
+$globalLast = if ($lastRunData -and $lastRunData.lastSuccessRun) { [string]$lastRunData.lastSuccessRun } else { $null }
+
+# Gap (horas) desde o ultimo sucesso do canal. Fallback: marco global; senao 24h.
+function Get-ChannelGapHours([string]$name) {
+    $iso = $null
+    if ($lastRunData -and $lastRunData.channels -and ($lastRunData.channels.PSObject.Properties.Name -contains $name)) {
+        $iso = [string]$lastRunData.channels.$name
+    }
+    if (-not $iso) { $iso = $globalLast }   # primeira vez com o schema novo: usa o marco global
+    if (-not $iso) { return 24 }            # nunca rodou com sucesso: um dia
+    # DateTimeOffset dos dois lados: compara INSTANTES reais (respeita o offset do
+    # iso e o UTC do agora). Com [datetime]::Parse a hora virava local e o gap
+    # inflava +3h no BRT -> janela vazava pra tras e reimportava item ja tratado.
+    try { return [int][math]::Ceiling(([datetimeoffset]::UtcNow - [datetimeoffset]::Parse($iso)).TotalHours) }
+    catch { return 24 }
+}
+
+# Frase da janela a partir de horas: sub-2-dias em horas, senao em dias.
+function Format-Window([int]$hours, [string]$tail) {
+    if ($hours -lt 48) { "as ultimas $hours horas $tail" }
+    else { "os ultimos " + [math]::Ceiling($hours / 24) + " dias $tail" }
+}
+
 if ($InitialLoad) {
     $jouleWindow   = "os ultimos 14 dias (e-mails) e o proximo dia util (calendario)"
     $copilotWindow = "os ultimos 7 dias (Teams, transcricoes e e-mails)"
     $waDays        = 90
     $meetingAhead  = 7
+    $waSinceIso    = $null   # carga inicial: sem marca d'agua, varre os 90 dias inteiros
 }
 else {
-    # Calcula gap real desde o ultimo run bem-sucedido.
-    if ($lastSuccessRun) {
-        try {
-            $gapHours = [int]([datetime]::UtcNow - [datetime]::Parse($lastSuccessRun)).TotalHours
-        } catch { $gapHours = 24 }
-    } else { $gapHours = 24 }
+    # Margem de seguranca: pequena sobreposicao pra nao perder itens na fronteira
+    # (relogio, itens que chegaram durante o processamento do run anterior).
+    $marginHours = 2
 
-    $jouleHours    = [math]::Min([math]::Max(72,  $gapHours), 14 * 24)
-    $copilotHours  = [math]::Min([math]::Max(24,  $gapHours), 72)
-    $waDaysGap     = [math]::Min([math]::Max(2,   [math]::Ceiling($gapHours / 24)), 14)
-    $jouleDays     = [math]::Ceiling($jouleHours / 24)
+    $jouleGap   = Get-ChannelGapHours "Joule"
+    $copilotGap = Get-ChannelGapHours "Copilot"
+    $waGap      = Get-ChannelGapHours "WhatsApp"
 
-    $jouleWindow   = "os ultimos $jouleDays dias (e-mails) e o proximo dia util (calendario)"
-    $copilotWindow = "as ultimas $copilotHours horas (Teams, transcricoes e e-mails)"
-    $waDays        = $waDaysGap
+    $jouleHours    = [math]::Min($jouleGap   + $marginHours, 14 * 24)
+    $copilotHours  = [math]::Min($copilotGap + $marginHours, 14 * 24)
+    $waDays        = [math]::Min([math]::Max(1, [math]::Ceiling(($waGap + $marginHours) / 24)), 14)
+
+    # Marca d'agua do WhatsApp: instante ISO da ultima analise OK, com margem de
+    # seguranca subtraida. Mensagens com envio <= esse instante ja foram processadas
+    # e NAO serao realimentadas ao LLM. Sem isso, uma janela alargada (folga/carga
+    # inicial) re-alimenta mensagens antigas e gera cards de conversas ja resolvidas.
+    # Reaproveitamos o mesmo campo channels.WhatsApp que Get-ChannelGapHours usa.
+    $waSinceIso = $null
+    $waMarkRaw = if ($lastRunData -and $lastRunData.channels -and
+                     ($lastRunData.channels.PSObject.Properties.Name -contains "WhatsApp")) {
+                     [string]$lastRunData.channels.WhatsApp } else { $globalLast }
+    if ($waMarkRaw) {
+        try { $waSinceIso = ([datetimeoffset]::Parse($waMarkRaw).AddHours(-$marginHours)).ToString("o") } catch {}
+    }
+
+    $jouleWindow   = Format-Window $jouleHours "(e-mails) e o proximo dia util (calendario)"
+    $copilotWindow = Format-Window $copilotHours "(Teams, transcricoes e e-mails)"
     $meetingAhead  = 1
 
-    if ($gapHours -gt 25) {
-        Log ("Gap desde ultimo run: ${gapHours}h -> janela expandida: Joule=${jouleDays}d Copilot=${copilotHours}h WA=${waDaysGap}d") Yellow
+    # WhatsApp: guarda de 20h para evitar duplicatas por reformulacao do LLM.
+    # Na pratica roda 1x/dia (manha); as rodadas do meio-dia e noite pulam.
+    # -SkipWhatsApp explicito na linha de comando nao e afetado (ja e $true).
+    if (-not $SkipWhatsApp -and $waGap -lt 20) {
+        Log "WhatsApp: pulado automaticamente (gap ${waGap}h < 20h; roda 1x/dia)." DarkGray
+        $SkipWhatsApp = $true
     }
+
+    $waSinceLabel = if ($waSinceIso) { " | marca dagua desde $waSinceIso" } else { "" }
+    Log ("Janela (delta por canal): Joule=${jouleHours}h Copilot=${copilotHours}h WhatsApp=${waDays}d${waSinceLabel}") DarkGray
 }
 
 $channelStatus = [ordered]@{}
@@ -385,7 +491,7 @@ if (-not $SkipJoule) {
         $prompt = $tpl -replace '\{\{JANELA\}\}', $jouleWindow
         Log "Joule: consultando e-mail/calendario ($jouleWindow)..." Cyan
 
-        $cap = Invoke-JsonWithRetry { & $JoulePs -Prompt $prompt -TimeoutSec 240 }
+        $cap = Invoke-JsonWithRetry { & $JoulePs -Prompt $prompt -TimeoutSec 600 }
         $rawFile = Join-Path $RawDir "joule-$ts.txt"
         [System.IO.File]::WriteAllText($rawFile, $cap.Text, [Text.Encoding]::UTF8)
 
@@ -415,7 +521,7 @@ if (-not $SkipCopilot) {
 
         # 360s: a busca do M365 Copilot sobre 24h de Teams+transcricoes+e-mail e
         # lenta e estourava os 240s (falha calada em Teams/e-mails). Mais folga.
-        $cap = Invoke-Capture { & $CopilotPs -Prompt $prompt -TimeoutSec 360 }
+        $cap = Invoke-Capture { & $CopilotPs -Prompt $prompt -TimeoutSec 600 }
         $rawFile = Join-Path $RawDir "copilot-$ts.txt"
         [System.IO.File]::WriteAllText($rawFile, $cap.Text, [Text.Encoding]::UTF8)
 
@@ -496,8 +602,11 @@ if (-not $SkipWhatsApp) {
         }
 
         $waEngineLabel = if ($WhatsAppEngine -eq 'joule') { "via Joule" } else { "com LLM local" }
-        Log "WhatsApp: analisando ultimos $waDays dias $waEngineLabel..." Cyan
-        $cap = Invoke-JsonWithRetry { & $AnalyzePs -Days $waDays -Json -Engine $WhatsAppEngine }
+        $waSinceLogLabel = if ($waSinceIso) { " (desde $waSinceIso)" } else { "" }
+        Log "WhatsApp: analisando ultimos $waDays dias $waEngineLabel$waSinceLogLabel..." Cyan
+        $waArgs = @{ Days = $waDays; Json = $true; Engine = $WhatsAppEngine }
+        if ($waSinceIso) { $waArgs["SinceIso"] = $waSinceIso }
+        $cap = Invoke-JsonWithRetry { & $AnalyzePs @waArgs }
         $rawFile = Join-Path $RawDir "whatsapp-$ts.json"
         [System.IO.File]::WriteAllText($rawFile, $cap.Text, [Text.Encoding]::UTF8)
 
@@ -670,8 +779,10 @@ function Read-LastSuccessRun {
     catch { return $null }
 }
 
-function Write-LastSuccessRun([string]$iso) {
-    $json = ([pscustomobject]@{ lastSuccessRun = $iso }) | ConvertTo-Json -Depth 5
+function Write-LastSuccessRun([string]$iso, $channels) {
+    $obj = [ordered]@{ lastSuccessRun = $iso }
+    if ($channels -and $channels.Count -gt 0) { $obj.channels = $channels }
+    $json = ([pscustomobject]$obj) | ConvertTo-Json -Depth 5
     $tmp = "$LastRunFile.tmp"
     [System.IO.File]::WriteAllText($tmp, $json, $Utf8NoBom)
     [System.IO.File]::Copy($tmp, $LastRunFile, $true)
@@ -860,9 +971,20 @@ if ($DryRun) {
 else {
     Write-Store $store
     Log "Store atualizado: $TasksFile" Green
-    # Rodada bem-sucedida: avanca o marco. Proxima rodada mede o incremento a partir daqui.
-    Write-LastSuccessRun $nowIso
-    Log "Marco de ultima rodada com sucesso atualizado: $nowIso" DarkGray
+    # Rodada bem-sucedida: avanca o marco GLOBAL e o marco POR CANAL, mas so dos
+    # canais que deram OK nesta rodada. Canal que falhou/pulou mantem o marco
+    # antigo -> a proxima rodada cobre o delta perdido DELE, sem reprocessar o que
+    # os outros ja trouxeram (e sem gerar cards duplicados no board).
+    $chanMarks = @{}
+    if ($lastRunData -and $lastRunData.channels) {
+        foreach ($p in $lastRunData.channels.PSObject.Properties) { $chanMarks[$p.Name] = [string]$p.Value }
+    }
+    foreach ($name in @("Joule","Copilot","WhatsApp","Meetings")) {
+        if ([string]$channelStatus[$name] -like "OK*") { $chanMarks[$name] = $nowIso }
+        # falhou/pulado: preserva o marco anterior (ou nenhum -> cai no global)
+    }
+    Write-LastSuccessRun $nowIso $chanMarks
+    Log "Marco de ultima rodada com sucesso atualizado (global + por canal): $nowIso" DarkGray
 }
 
 if ($InitialLoad -and $reviewItems.Count -gt 0) {

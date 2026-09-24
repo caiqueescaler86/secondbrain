@@ -20,7 +20,7 @@ const PREFIX = {
   aguardando: "Aguardando", preparar: "Preparar", risco: "Risco", referencia: "Ref",
 };
 
-let STATE = { tasks: [], search: "", showRef: false, showDone: false, open: new Set(), filter: null, sig: "", sort: (localStorage.getItem("sb-sort") === "data" ? "data" : "prio") };
+let STATE = { tasks: [], search: "", showDone: false, open: new Set(), seen: new Set(), filter: null, sig: "", sort: (localStorage.getItem("sb-sort") === "data" ? "data" : "prio") };
 
 const STATUS_KEYS = ["fazer", "responder", "cobrar", "aguardando", "preparar", "risco", "referencia"];
 const PRIO_KEYS = ["alta", "media", "baixa"];
@@ -34,6 +34,9 @@ const el = (tag, cls, txt) => {
   return n;
 };
 const todayStr = () => new Date().toISOString().slice(0, 10);
+
+// Card criado HOJE e ainda nao reconhecido pelo usuario (abrir o card "quita" o aviso).
+const isNew = t => !t.done && (t.createdAt || "").slice(0, 10) === todayStr() && !STATE.seen.has(t.sbid);
 
 // normaliza texto p/ comparacao: minusculo, sem acento, espacos colapsados
 const normalize = s => (s || "").toString().toLowerCase()
@@ -174,13 +177,7 @@ function visible(task) {
   if (!showDone && task.snoozedUntil && task.snoozedUntil > todayStr()) return false;
 
   if (f) {
-    // Com filtro do agente ativo: ignora o gate de referencia/baixa (mostra o
-    // que casar, mesmo referencia) e aplica o filtro estruturado.
     if (!matchFilter(task, f)) return false;
-  } else {
-    const offBoard = task.board && task.board !== "active";
-    const isLow = offBoard || task.categoria === "referencia" || task.prioridade === "baixa";
-    if (isLow && !STATE.showRef) return false;
   }
 
   if (STATE.search) {
@@ -253,7 +250,7 @@ const byDate = (a, b) => {
 };
 // Comparador ativo conforme o modo escolhido (persistido em localStorage).
 const sortCmp = () => (STATE.sort === "data" ? byDate : byPrio);
-const isRef = t => (t.categoria === "referencia") || (t.board && t.board !== "active");
+const isRef = t => t.categoria === "referencia";
 const isWaiting = t => (t.status === "aguardando") || (t.categoria === "aguardando");
 
 function feedSection(title, list, cls, feed) {
@@ -312,6 +309,7 @@ function renderCard(task) {
   card.dataset.sbid = task.sbid;
   if (task.done) card.classList.add("done");
   if (STATE.open.has(task.sbid)) card.classList.add("open");
+  if (isNew(task)) card.classList.add("is-new");
 
   const top = el("div", "card-top");
   // Concluir em 1 clique, sem precisar expandir o card (parte externa).
@@ -322,6 +320,8 @@ function renderCard(task) {
   top.appendChild(quick);
   top.appendChild(el("span", "badge st-" + (task.status || "x"), PREFIX[task.status] || task.status || "•"));
   if (task.prioridade) top.appendChild(el("span", "badge " + task.prioridade, task.prioridade));
+  // Badge "novo": card criado hoje e ainda nao aberto pelo usuario.
+  if (isNew(task)) top.appendChild(el("span", "badge novo", "novo"));
   // Em modo duplicados, marca a qual grupo o card pertence.
   if (STATE.filter && STATE.filter.dupes && STATE.filter.groupOf) {
     const gi = STATE.filter.groupOf[task.sbid];
@@ -388,7 +388,18 @@ function renderCard(task) {
 
   card.addEventListener("click", () => {
     const isOpen = card.classList.toggle("open");
-    if (isOpen) STATE.open.add(task.sbid); else STATE.open.delete(task.sbid);
+    if (isOpen) {
+      STATE.open.add(task.sbid);
+      // "Reconhece" o card novo: remove o realce visual sem precisar recriar o board.
+      if (card.classList.contains("is-new")) {
+        STATE.seen.add(task.sbid);
+        card.classList.remove("is-new");
+        const badgeNovo = card.querySelector(".badge.novo");
+        if (badgeNovo) badgeNovo.remove();
+      }
+    } else {
+      STATE.open.delete(task.sbid);
+    }
   });
   return card;
 }
@@ -595,9 +606,10 @@ async function askJoule(question, bubble) {
   }, 1500);
 }
 
-// Roteamento: comandos de filtro/limpar/duplicados vs pergunta normal.
+// Roteamento: comandos de filtro/limpar/duplicados/criar vs pergunta normal.
 const RE_CLEAR = /^\s*(limpa|limpar|tira\w*\s+o?\s*filtro|remove\w*\s+o?\s*filtro|mostrar?\s+tudo|tudo\s+de\s+novo|ver\s+tudo)/i;
 const RE_DUPE  = /(duplicad|repetid|poss[íi]ve\w*\s+duplicad|tem\s+repetido|duplicat|iguais)/i;
+const RE_CREATE = /^\s*(me\s+)?(cria\w*|crie|adiciona\w*|adicione|anota\w*|anote|apont\w+|registr\w+|nova\s+tarefa|novo\s+(card|lembrete)|lembr\w+\s+(de|que|-?me)|preciso\s+|tenho\s+que\s+|agenda\w*\s+)/i;
 const RE_FILTER = /^\s*(me\s+)?(traga|traz|tras|mostra|mostre|mostrar|exib\w*|filtr\w*|deixa\s+s[óo]|deixe\s+s[óo]|s[óo]\s|somente|apenas|esconde|esconda|oculta\w*|lista\s|listar)/i;
 
 function agentSend() {
@@ -623,9 +635,90 @@ function agentSend() {
   scrollAgentLog();
   setAgentBusy(true);
 
-  if (RE_FILTER.test(q)) askFilter(q, bubble);
+  if (RE_CREATE.test(q)) askCreate(q, bubble);
+  else if (RE_FILTER.test(q)) askFilter(q, bubble);
   else if (AGENT.target === "joule") askJoule(q, bubble);
   else askLocal(q, bubble);
+}
+
+// ---------- criar tarefa pela conversa ----------
+// O modelo do alvo atual extrai os campos (fora do servidor, p/ nao congelar o
+// cockpit single-thread); grava via /api/task. Se o modelo falhar, cai no
+// fallback: cria com a frase crua como assunto (nunca perde a captura).
+function buildCreatePrompt(q) {
+  return [
+    "Voce converte uma frase em PT-BR numa UNICA tarefa. Hoje e " + todayStr() + ".",
+    "Responda APENAS com um objeto JSON valido: sem texto fora dele, sem crases, sem markdown.",
+    'Formato exato: {"assunto":string,"pessoa":string|null,"proxima_acao":string|null,"prazo":"YYYY-MM-DD"|null,"status":string,"prioridade":string,"notas":string|null}',
+    "status valido: " + STATUS_KEYS.join(", ") + " (use 'fazer' na duvida). prioridade valida: " + PRIO_KEYS.join(", ") + " (use 'media' na duvida, 'alta' se cliente/prazo/risco).",
+    "NAO invente: o que nao estiver claro vira null. Resolva datas relativas (amanha, sexta, semana que vem, dia 30) para ISO usando a data de hoje.",
+    "assunto = nucleo curto da tarefa, SEM repetir o nome da pessoa (a pessoa vai no campo pessoa).",
+    "",
+    "Frase: " + q,
+  ].join("\n");
+}
+
+function sanitizeCreate(j, fallbackText) {
+  j = j || {};
+  const clean = v => {
+    const s = (v == null ? "" : String(v)).trim();
+    return (s && s.toLowerCase() !== "null") ? s : "";
+  };
+  let due = clean(j.prazo);
+  if (due && !/^\d{4}-\d{2}-\d{2}$/.test(due)) due = "";
+  return {
+    assunto: clean(j.assunto) || fallbackText,
+    pessoa: clean(j.pessoa),
+    proxima_acao: clean(j.proxima_acao),
+    dueDate: due,
+    status: STATUS_KEYS.includes(clean(j.status)) ? clean(j.status) : "fazer",
+    prioridade: PRIO_KEYS.includes(clean(j.prioridade)) ? clean(j.prioridade) : "media",
+    notas: clean(j.notas),
+    origem: "agente",
+  };
+}
+
+async function askCreate(q, bubble) {
+  let raw = null;
+  try {
+    raw = await modelRaw(buildCreatePrompt(q));
+  } catch (e) {
+    if (e && e.name === "AbortError") { const w = bubble.parentElement; if (w) w.remove(); setAgentBusy(false); return; }
+    raw = null; // modelo fora do ar -> fallback com texto cru
+  }
+  const payload = sanitizeCreate(raw ? parseFilterJson(raw) : null, q);
+  bubble.classList.remove("typing");
+  try {
+    const res = await fetch("/api/task", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => null);
+    if (res.status === 409) {
+      const t = data && data.task;
+      bubble.textContent = "Já existe algo parecido: " + ((t && (t.titulo || t.assunto)) || "essa tarefa") + ".";
+      scrollAgentLog(); setAgentBusy(false); return;
+    }
+    if (!res.ok || !data || !data.sbid) throw new Error("HTTP " + res.status);
+    STATE.tasks.push(data);
+    STATE.sig = JSON.stringify(STATE.tasks);
+    // Se houver filtro ativo, limpa pra o card novo aparecer (senão pode ficar oculto).
+    if (STATE.filter) clearFilter(); else render();
+    const bits = [];
+    if (data.pessoa) bits.push(data.pessoa);
+    if (data.dueDate) bits.push("prazo " + data.dueDate);
+    bubble.textContent = "✓ criei: " + (data.assunto || data.titulo || "(sem assunto)") +
+      (bits.length ? " (" + bits.join(" · ") + ")" : "");
+    toast("Tarefa criada 🎯");
+  } catch (e) {
+    bubble.classList.add("err");
+    bubble.textContent = "Não consegui salvar a tarefa no cockpit.";
+    toast("não criei a tarefa");
+    console.error(e);
+  } finally {
+    setAgentBusy(false);
+  }
 }
 
 // ---------- filtro pela conversa (modelo monta o filtro) ----------
@@ -684,15 +777,17 @@ function sanitizeFilter(f) {
   return out;
 }
 
-async function filterViaLocal(q) {
+// Transportes genericos: mandam um prompt ao modelo do alvo atual e devolvem o
+// texto cru. Usados pelo filtro (buildFilterPrompt) e pela criacao (buildCreatePrompt).
+async function promptViaLocal(prompt) {
   const ctrl = new AbortController(); AGENT.ctrl = ctrl;
   try {
     const res = await fetch(LLAMA + "/v1/chat/completions", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "qwen-coder-local", stream: false, temperature: 0, max_tokens: 300,
+        model: "qwen-coder-local", stream: false, temperature: 0, max_tokens: 400,
         response_format: { type: "json_object" },
-        messages: [{ role: "user", content: buildFilterPrompt(q) }],
+        messages: [{ role: "user", content: prompt }],
       }),
       signal: ctrl.signal,
     });
@@ -702,11 +797,11 @@ async function filterViaLocal(q) {
   } finally { AGENT.ctrl = null; }
 }
 
-function filterViaJoule(q) {
+function promptViaJoule(prompt) {
   return new Promise((resolve, reject) => {
     fetch("/api/joule", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: buildFilterPrompt(q) }),
+      body: JSON.stringify({ prompt: prompt }),
     }).then(r => r.json()).then(j => {
       if (!j.id) { reject(new Error(j.error || "falha ao iniciar")); return; }
       AGENT.poll = setInterval(async () => {
@@ -723,6 +818,10 @@ function filterViaJoule(q) {
   });
 }
 
+function modelRaw(prompt) {
+  return (AGENT.target === "joule") ? promptViaJoule(prompt) : promptViaLocal(prompt);
+}
+
 function filterFail(bubble, e) {
   if (e && e.name === "AbortError") { const w = bubble.parentElement; if (w) w.remove(); setAgentBusy(false); return; }
   bubble.classList.remove("typing");
@@ -737,7 +836,7 @@ function filterFail(bubble, e) {
 async function askFilter(q, bubble) {
   let raw = null;
   try {
-    raw = (AGENT.target === "joule") ? await filterViaJoule(q) : await filterViaLocal(q);
+    raw = await modelRaw(buildFilterPrompt(q));
   } catch (e) { filterFail(bubble, e); return; }
   const parsed = parseFilterJson(raw);
   if (!parsed) { filterFail(bubble, new Error("json invalido")); return; }
@@ -852,7 +951,6 @@ function applyDuplicatesFilter() {
 
 // ---------- wire up ----------
 $("#search").addEventListener("input", e => { STATE.search = e.target.value.trim(); render(); });
-$("#show-ref").addEventListener("change", e => { STATE.showRef = e.target.checked; render(); });
 $("#show-done").addEventListener("change", e => { STATE.showDone = e.target.checked; render(); });
 $("#refresh").addEventListener("click", load);
 $("#expand-all").addEventListener("click", toggleExpandAll);

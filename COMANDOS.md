@@ -116,10 +116,49 @@ Botão **🧠 Agente** (canto superior direito) abre o painel de IA. Dois modos:
 - `"possíveis duplicados"` → detecta localmente (sem LLM), marca grupos ≈ no board.
 - `"limpar filtro"` (ou o **✕** no chip) → volta tudo.
 
+**Criar tarefa por linguagem natural** — o agente também *age*, não só filtra:
+- `"cria tarefa: ligar pro João da Cantu amanhã sobre a renovação"` → vira card com **pessoa** (João da Cantu), **prazo** (amanhã) e **status** entendidos.
+- `"anota que preciso preparar o QBR da Emarsys pra sexta"` → card status=preparar, prazo=sexta.
+- `"lembra de mandar a planilha de contatos"` → card simples.
+- Frase repetida (mesma pessoa+assunto) → *"já existe algo parecido"* (não duplica).
+- Se o modelo estiver fora do ar, o card é criado **com o texto cru** — a captura nunca se perde.
+
 **Perguntas livres** também funcionam — ex.: `"o que é mais urgente hoje?"`, `"resume o que o cliente X pediu"`.
 
-> Verbos que ativam o filtro (detectados no browser, instantâneo): *traga, mostra, filtra, deixa só, apenas, esconde, oculta…*
+> Verbos que **criam** (detectados no browser): *cria, adiciona, anota, registra, lembra de, preciso, tenho que, nova tarefa…*
+> Verbos que ativam o **filtro**: *traga, mostra, filtra, deixa só, apenas, esconde, oculta…*
 > Qualquer outra frase → pergunta normal pro modelo selecionado.
+>
+> A extração (pessoa/prazo/status) roda no **modelo selecionado** (Joule ou IA local). Com a IA local a criação leva alguns segundos; o card aparece assim que confirma.
+
+---
+
+## 🎤 Captura por voz ("Jarvis" — local)
+
+Fala o pedido sem parar o que está fazendo e vira card no cockpit. **Dois gatilhos**,
+os dois valem:
+
+- **Ctrl+Shift+B** (atalho global — funciona em qualquer app).
+- **Wake word "hey jarvis"** (dizer em voz alta, sem tocar no teclado).
+
+Fluxo: gatilho → janela **"● Ouvindo (local)"** → você fala → **~2s de silêncio** encerra
+→ **whisper** transcreve (pt) → extrai a tarefa (pessoa/prazo/status) → card no cockpit.
+**Tudo local; o áudio nunca sai da máquina** e o microfone é sempre liberado ao fim.
+
+| Comando | O que faz |
+|---|---|
+| `powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\Joule\SecondBrain\setup-voice.ps1"` | **Uma vez.** Cria o ambiente Python isolado (`voice\.venv`), instala as libs, baixa o modelo "hey jarvis", resolve o whisper e cria o **atalho de logon** que sobe o listener sozinho. |
+| `Start-Process "C:\Users\I827769\Documents\Joule\SecondBrain\voice\.venv\Scripts\pythonw.exe" -ArgumentList '"C:\Users\I827769\Documents\Joule\SecondBrain\voice\voice_listen.py"'` | **Liga o listener agora** (sem deslogar), em segundo plano. |
+
+> **Whisper local:** o listener usa o whisper do próprio projeto
+> (`SecondBrain\whisper\Release\whisper-cli.exe`) porque ele **roda no seu processo** —
+> o `whisper-cli.exe` tem um bloqueio (ACE Deny) quando é o Claude que o executa, mas no
+> seu logon roda liso. Se faltar o whisper, rode o `whisper-setup` antes.
+>
+> **Wake word opcional:** se o download do modelo for bloqueado, o listener ainda
+> funciona **só com Ctrl+Shift+B**. Diagnóstico em `voice\voice.log`.
+>
+> **Lag de UI:** o card aparece no próximo refresh de 1 min do cockpit (ou clique `⟳`).
 
 ---
 
@@ -184,6 +223,12 @@ C:\Users\I827769\Documents\Joule\SecondBrain\
 ├─ meeting-watch.ps1       ← vigia: detecta reunião ao vivo e dispara a gravação
 ├─ record-meeting.ps1      ← grava (mic + sistema) + mixa + transcreve (whisper)
 ├─ setup-meeting.ps1       ← setup único da gravação (NAudio + tarefa de logon)
+├─ setup-voice.ps1         ← setup único da voz (venv + wake word + atalho de logon)
+├─ voice\                  ← listener de voz (Jarvis): roda no processo do usuário
+│   ├─ voice_listen.py     ← Ctrl+Shift+B + "hey jarvis" → whisper → llama → card
+│   ├─ requirements.txt    ← libs Python (openWakeWord, sounddevice, pynput…)
+│   ├─ config.json         ← caminhos resolvidos pelo setup (gerado)
+│   └─ .venv\              ← ambiente Python isolado (gerado)
 ├─ lib\NAudio.dll          ← captura de áudio (baixada pelo setup, sem admin)
 ├─ Meetings\               ← transcrições das reuniões (.txt/.json)
 ├─ processed\

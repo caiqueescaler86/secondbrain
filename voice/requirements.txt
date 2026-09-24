@@ -1,0 +1,10 @@
+# SecondBrain — voice listener (roda no processo do usuário, nunca via Claude)
+# Wake word robusta (escolha do usuário) + hotkey global. Tudo local/offline.
+openwakeword
+onnxruntime
+sounddevice
+pynput
+numpy
+requests
+pystray
+Pillow
