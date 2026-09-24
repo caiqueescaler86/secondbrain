@@ -89,6 +89,8 @@ Nada seu e aberto fica escondido num canto.
 - **"Aguardando os outros"** e **"Referência / baixa"** ficam em seções recolhíveis
   embaixo (clique no título pra abrir/fechar).
 - **Clicar no card** → expande resumo, risco, notas e os botões.
+- Cards **criados hoje e ainda não abertos** ganham badge **"novo"** + realce verde —
+  abrir o card quita o destaque (útil pra ver o que cada rodada trouxe).
 - **✓ (canto sup. esq. do card)** → conclui em 1 clique sem expandir · confete 🎉 e elogio no toast.
 - **Feito** → mesmo efeito de dentro do card · **Adiar** → joga pra amanhã · **↑↓ Prio** → cicla prioridade.
 - **Notas** → digita direto no card (salva ao sair do campo, **sem piscar a tela**).
@@ -133,13 +135,14 @@ Botão **🧠 Agente** (canto superior direito) abre o painel de IA. Dois modos:
 
 ---
 
-## 🎤 Captura por voz ("Jarvis" — local)
+## 🎤 Captura por voz ("hey secondbrain" — local)
 
 Fala o pedido sem parar o que está fazendo e vira card no cockpit. **Dois gatilhos**,
 os dois valem:
 
 - **Ctrl+Shift+B** (atalho global — funciona em qualquer app).
-- **Wake word "hey jarvis"** (dizer em voz alta, sem tocar no teclado).
+- **Wake word "hey secondbrain"** (dizer em voz alta, sem tocar no teclado).
+  Modelo custom treinado no Kaggle com openWakeWord — já em `voice\models\hey_secondbrain.onnx`.
 
 Fluxo: gatilho → janela **"● Ouvindo (local)"** → você fala → **~2s de silêncio** encerra
 → **whisper** transcreve (pt) → extrai a tarefa (pessoa/prazo/status) → card no cockpit.
@@ -147,7 +150,7 @@ Fluxo: gatilho → janela **"● Ouvindo (local)"** → você fala → **~2s de 
 
 | Comando | O que faz |
 |---|---|
-| `powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\Joule\SecondBrain\setup-voice.ps1"` | **Uma vez.** Cria o ambiente Python isolado (`voice\.venv`), instala as libs, baixa o modelo "hey jarvis", resolve o whisper e cria o **atalho de logon** que sobe o listener sozinho. |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\Joule\SecondBrain\setup-voice.ps1"` | **Uma vez.** Cria o ambiente Python isolado (`voice\.venv`), instala as libs, resolve o whisper e cria o **atalho de logon** que sobe o listener sozinho. O modelo custom já está no repo. |
 | `Start-Process "C:\Users\I827769\Documents\Joule\SecondBrain\voice\.venv\Scripts\pythonw.exe" -ArgumentList '"C:\Users\I827769\Documents\Joule\SecondBrain\voice\voice_listen.py"'` | **Liga o listener agora** (sem deslogar), em segundo plano. |
 
 > **Whisper local:** o listener usa o whisper do próprio projeto
@@ -155,8 +158,9 @@ Fluxo: gatilho → janela **"● Ouvindo (local)"** → você fala → **~2s de 
 > o `whisper-cli.exe` tem um bloqueio (ACE Deny) quando é o Claude que o executa, mas no
 > seu logon roda liso. Se faltar o whisper, rode o `whisper-setup` antes.
 >
-> **Wake word opcional:** se o download do modelo for bloqueado, o listener ainda
-> funciona **só com Ctrl+Shift+B**. Diagnóstico em `voice\voice.log`.
+> **Wake word pronta:** o modelo `hey_secondbrain.onnx` já está em `voice\models\` — não
+> precisa baixar nada extra. Se não carregar por algum motivo, o listener segue **só com
+> Ctrl+Shift+B**. Diagnóstico em `voice\voice.log`.
 >
 > **Lag de UI:** o card aparece no próximo refresh de 1 min do cockpit (ou clique `⟳`).
 
@@ -178,7 +182,14 @@ Fluxo: gatilho → janela **"● Ouvindo (local)"** → você fala → **~2s de 
 | `powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\Joule\SecondBrain\setup-meeting.ps1"` | **Uma vez.** Baixa a NAudio (captura de áudio, sem admin), valida whisper/ffmpeg/Outlook e cria o **atalho de logon** que sobe o vigia sozinho. |
 | `Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\Users\I827769\Documents\Joule\SecondBrain\meeting-watch.ps1'` | **Liga o vigia agora** (sem deslogar). Ele detecta quando uma reunião começa (uso do microfone) e grava sozinho; para quando o mic é liberado. |
 | `powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\Joule\SecondBrain\record-meeting.ps1" -Label teste` | **Teste manual.** Grava agora até você clicar **Parar**, mixa e transcreve. Bom pra validar áudio+whisper antes de uma reunião de verdade. |
-| `... record-meeting.ps1 -Label reuniao -KeepAudio` | Igual, mas **guarda o WAV** em `Meetings\<base>.wav` pra você reouvir trechos. Sem `-KeepAudio` o áudio é temporário (só fica a transcrição). |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\Joule\SecondBrain\record-meeting.ps1" -Label reuniao -KeepAudio` | Igual, mas **guarda o WAV** em `Meetings\<base>.wav` pra você reouvir trechos. Sem `-KeepAudio` o áudio é temporário (só fica a transcrição). |
+
+> **Fone/headset:** o `record-meeting.ps1` usa o device de áudio de **Communications**
+> (não o Multimedia default), então captura corretamente os outros participantes mesmo
+> quando você está no fone. Funciona sem configuração extra.
+>
+> **Transcrição limpa:** o whisper roda com `-mc 0` para evitar o loop de alucinação
+> (frases repetidas que travam a transcrição).
 
 > **Auto-start nesta máquina:** o Agendador de Tarefas está bloqueado por GPO
 > (`schtasks` dá *Access denied`), então o setup usa a **pasta Inicializar do Windows**
@@ -224,10 +235,12 @@ C:\Users\I827769\Documents\Joule\SecondBrain\
 ├─ record-meeting.ps1      ← grava (mic + sistema) + mixa + transcreve (whisper)
 ├─ setup-meeting.ps1       ← setup único da gravação (NAudio + tarefa de logon)
 ├─ setup-voice.ps1         ← setup único da voz (venv + wake word + atalho de logon)
-├─ voice\                  ← listener de voz (Jarvis): roda no processo do usuário
-│   ├─ voice_listen.py     ← Ctrl+Shift+B + "hey jarvis" → whisper → llama → card
+├─ voice\                  ← listener de voz: roda no processo do usuário
+│   ├─ voice_listen.py     ← Ctrl+Shift+B + "hey secondbrain" → whisper → llama → card
+│   ├─ models\             ← modelos de wake word
+│   │   └─ hey_secondbrain.onnx  ← modelo custom (treinado no Kaggle)
 │   ├─ requirements.txt    ← libs Python (openWakeWord, sounddevice, pynput…)
-│   ├─ config.json         ← caminhos resolvidos pelo setup (gerado)
+│   ├─ config.json         ← caminhos resolvidos pelo setup (gerado, não versionado)
 │   └─ .venv\              ← ambiente Python isolado (gerado)
 ├─ lib\NAudio.dll          ← captura de áudio (baixada pelo setup, sem admin)
 ├─ Meetings\               ← transcrições das reuniões (.txt/.json)

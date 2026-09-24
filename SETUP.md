@@ -117,11 +117,12 @@ C:\Users\I827769\Documents\Joule\SecondBrain
    ```
 
 7. **Setup de voz** (uma vez, opcional) — cria o ambiente Python isolado, instala as
-   libs, baixa o modelo "hey jarvis", resolve o whisper e cria o auto-start do listener:
+   libs, resolve o whisper e cria o auto-start do listener:
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\Joule\SecondBrain\setup-voice.ps1"
    ```
-   Depois, os gatilhos são **Ctrl+Shift+B** e a wake word **"hey jarvis"**. O listener
+   Depois, os gatilhos são **Ctrl+Shift+B** e a wake word **"hey secondbrain"** (modelo
+   custom treinado em Kaggle, já em `voice\models\hey_secondbrain.onnx`). O listener
    roda **no seu processo** (por isso o whisper não esbarra na ACE Deny). Veja §9.1.
 
 8. **Crie os comandos do dia a dia** no seu `$PROFILE` (§6) e **recarregue**:
@@ -247,8 +248,9 @@ justamente para o Ctrl+C funcionar).
 - Clique no card → expande resumo/risco/notas/botões. **Feito**, **Adiar**,
   **↑↓ Prio**, **Notas** (salva ao sair do campo).
 - Recarrega sozinho a cada 1 min; `⟳` recarrega na hora. Suas ações são preservadas
-  na próxima rodada. Há uma **caixinha "Agente"** cujo alvo padrão é o **Joule**
-  (assíncrono, lê `tasks.json`).
+  na próxima rodada. Cards **criados na última rodada e ainda não abertos** aparecem com
+  um badge **"novo"** e realce verde — abrir o card quita o destaque. Há uma **caixinha "Agente"**
+  cujo alvo padrão é o **Joule** (assíncrono, lê `tasks.json`).
 
 **Demo visual** (`cockpit-demo.ps1`): `cockpitdemo` semeia 9 tarefas de exemplo e
 abre o cockpit; `cockpitdemo -Reset` limpa o store (volta a `[]`).
@@ -388,8 +390,10 @@ até de fone) e o whisper transcreve. A transcrição vira card no cockpit via
   e (2) **calendário** via Outlook COM (best-effort). Ao detectar, dispara o
   `record-meeting.ps1`; quando o mic é liberado, cria o StopFlag e a gravação encerra,
   mixa e transcreve sozinha. Nunca grava em dobro.
-- **`record-meeting.ps1`**: grava sistema (WASAPI loopback) + microfone (WaveInEvent),
-  mixa/normaliza com ffmpeg (16 kHz mono) e transcreve com whisper → `Meetings\<data>-<label>.txt` + `.json`.
+- **`record-meeting.ps1`**: grava sistema (**WASAPI loopback no device de Communications**,
+  capturando os outros participantes mesmo quando você está no **fone/headset**) +
+  microfone (WaveInEvent), mixa/normaliza com ffmpeg (16 kHz mono) e transcreve com
+  whisper (`-mc 0` para evitar loop de alucinação) → `Meetings\<data>-<label>.txt` + `.json`.
   **Sempre** mostra uma janelinha **"● Gravando (local)"** com botão **Parar**
   (salvaguarda legal — nunca é silencioso).
 - **`meeting-detector.ps1 -Ahead <n> -Json`**: lê os sidecars `Meetings\*.json` ainda
@@ -409,14 +413,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\I827769\Documents\
 > **Consentimento é sua responsabilidade:** avise os participantes e respeite a
 > política da empresa. A janela "Gravando" existe para nunca ser silencioso.
 
-### 9.1 Captura por voz ("Jarvis" — `voice\voice_listen.py`)
+### 9.1 Captura por voz ("hey secondbrain" — `voice\voice_listen.py`)
 
 Captura um pedido falado e cria um card, **sem parar o que você está fazendo**. Roda
 como um listener sempre ativo **no seu processo** (atalho de logon) — é por isso que o
 whisper funciona aqui, ao contrário de dentro do Claude (ACE Deny).
 
 - **Gatilhos** (os dois valem): **Ctrl+Shift+B** (hotkey global via `pynput`) e a
-  **wake word "hey jarvis"** (openWakeWord ouvindo o mic em frames 16 kHz).
+  **wake word "hey secondbrain"** (modelo custom treinado em Kaggle com openWakeWord,
+  disponível em `voice\models\hey_secondbrain.onnx`).
 - **Fluxo:** gatilho → janela **"● Ouvindo (local)"** (consentimento, always-on-top) →
   grava mic 16 kHz mono → **VAD por energia** encerra após **~2s de silêncio** (teto
   ~20s) → `whisper-cli.exe` local transcreve (pt) → extrai `{assunto, pessoa, prazo,
@@ -428,7 +433,7 @@ whisper funciona aqui, ao contrário de dentro do Claude (ACE Deny).
 - **Whisper local do projeto:** o `setup-voice.ps1` prefere
   `SecondBrain\whisper\Release\whisper-cli.exe` (evita o Deny do `C:\`); cai para
   `C:\whisper` se não achar. Os caminhos resolvidos ficam em `voice\config.json`.
-- **Degradação:** se o modelo de wake word não baixar (proxy/GPO), o listener segue
+- **Degradação:** se o modelo de wake word não carregar, o listener segue
   **só com Ctrl+Shift+B**. Diagnóstico em `voice\voice.log`.
 
 Ligar o listener agora (sem deslogar):
@@ -537,7 +542,7 @@ o arquivo e a mudança entra na próxima rodada, sem mexer em nenhum script.
 | Cockpit não sobe — "Access denied" ao abrir a porta | Rode uma vez como admin: `netsh http add urlacl url=http://127.0.0.1:8787/ user=$env:USERNAME`. Ou use outra porta: `-Port 8791`. |
 | Cockpit não parava com Ctrl+C | Já corrigido: usa `GetContextAsync` + `WaitOne(300ms)` em vez de `GetContext()` bloqueante. Se travar mesmo assim, ache o dono da porta com `netsh http show servicestate view=requestq` e mate o PID. |
 | Acentos viram "�" na saída de um script chamado via `-RedirectStandardOutput` | O stdout é capturado na code page do console. Os scripts setam `[Console]::OutputEncoding = UTF8`; se você escrever um novo, faça o mesmo. |
-| Copilot: "Timeout esperando resposta" | Normalmente é a **janela em background sendo estrangulada/virtualizada** pelo WebView2 (não seletor morto). Correção do adapter: `setFocusEmulationEnabled` + scroll-render + recuperação. Deixe a janela do Copilot visível/ativa se persistir. |
+| Copilot: "Timeout esperando resposta" | Normalmente é a **janela em background sendo estrangulada/virtualizada** pelo WebView2 (não seletor morto). O adapter faz `ShowWindow(SW_RESTORE)` via Win32 para restaurar a janela antes de enviar o prompt — se a janela estiver minimizada/oculta, ela é restaurada automaticamente. Se persistir, verifique se o processo `M365Copilot.exe` está rodando. |
 | Copilot ignora o clique/tecla / botão Send não aparece | O editor (Fluent UI/React) **ignora eventos sintéticos**. O envio exige input CONFIÁVEL via CDP (`Input.dispatchMouseEvent`/`insertText`/`Enter`). Não tente automatizar via JS `.click()`. |
 | Copilot "otimiza"/reescreve o prompt | Use **comando imperativo direto**, sem cabeçalho tipo "# Prompt" (o M365 Copilot otimiza prompts-template). Os `prompts\copilot.md` já pedem "não reescreva, execute". |
 | Copilot: "chave de policy bloqueada" ao habilitar debug | Em máquina GPO a policy do WebView2 é read-only. Se a chave já tem a porta certa, basta relançar o app. Senão, rode uma vez como admin ou inicie o Copilot com o debug já ligado. |
@@ -545,6 +550,8 @@ o arquivo e a mudança entra na próxima rodada, sem mexer em nenhum script.
 | WhatsApp: "Maximum active sessions" (BiDi travado) | O Firefox não libera a sessão BiDi órfã. O `whatsapp-audio.ps1` **reinicia o Firefox** para zerar as sessões (por isso o áudio é o último passo). |
 | WhatsApp: 0 áudios extraídos | Precisa do Firefox/WhatsApp Web aberto. Fallback: arraste os `.ogg`/`.opus` para `WhatsApp\audio-inbox\` e rode `whatsapp-transcribe.ps1`. |
 | Análise local muito lenta / não responde | O modelo 30B demora a carregar; o orquestrador espera a porta 19001 até 90s. Confirme o llama no ar (`start-llama.ps1`). A LLM local é lenta para chat — para chat prefira o Joule. |
+| Reunião gravada — outros participantes com áudio silencioso | O `WasapiLoopbackCapture` por padrão captura o device **Multimedia**. Se você estiver no **fone/headset**, o Teams usa o device **Communications** — o `record-meeting.ps1` já está configurado para usar o device de Communications, então funciona corretamente com headset. |
+| Whisper em loop / frases repetidas na transcrição | Sem `--condition-on-previous-text false` (indisponível nesta versão), use `-mc 0` (`--max-context 0`). O `record-meeting.ps1` já passa `-mc 0` automaticamente. Se rodar whisper manual, inclua a flag. |
 | Reunião não grava sozinha | Confirme o `meeting-watch.ps1` rodando (auto-start de logon) e a NAudio instalada (senão, só-microfone). Se COM do Outlook estiver bloqueado, ele usa só o sinal do microfone. |
 | whisper não roda dentro do Claude | ACE Deny — rode do terminal do usuário. |
 | `tasks.json` corrompido | **NÃO** conserte com one-liner PowerShell (embrulha em `{value,Count}`). Use Python ou deixe o orquestrador regravar. |
