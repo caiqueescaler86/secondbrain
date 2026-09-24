@@ -129,11 +129,14 @@ class Indicator:
         try:
             import tkinter as _tk2
             HERE_ = os.path.dirname(os.path.abspath(__file__))
-            png   = os.path.join(os.path.dirname(HERE_), "cockpit", "favicon-256.png")
+            # Prefere logo.png local (64x64 RGBA, alta qualidade, fundo transparente).
+            # Fallback: favicon do cockpit (subsampled de 256px).
+            local_logo = os.path.join(HERE_, "logo.png")
+            legacy_logo = os.path.join(os.path.dirname(HERE_), "cockpit", "favicon-256.png")
+            png = local_logo if os.path.exists(local_logo) else legacy_logo
             if os.path.exists(png):
                 raw = _tk2.PhotoImage(file=png)
-                # subsample(7) -> 256/7 ≈ 36px
-                self._logo_img = raw.subsample(7, 7)
+                self._logo_img = raw if png == local_logo else raw.subsample(7, 7)
         except Exception:
             pass
 
