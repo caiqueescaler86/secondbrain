@@ -5,16 +5,27 @@ param(
     [switch]$KeepAudio   # guarda o WAV mixado em Meetings\<base>.wav p/ reouvir (ocupa disco)
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+
+# Captura QUALQUER erro nao-tratado e registra no log antes de morrer.
+trap {
+    try {
+        $msg = "ERRO FATAL nao-tratado: $($_.Exception.Message)`r`n$($_.ScriptStackTrace)"
+        [Console]::Error.WriteLine($msg)
+        $lf = Join-Path (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "Meetings") "record-log.txt"
+        [IO.File]::AppendAllText($lf, "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] $msg`r`n", [Text.Encoding]::UTF8)
+    } catch {}
+    continue
+}
 
 # ============================================================
 # SECONDBRAIN - RECORD MEETING (gravacao local de reuniao)
 #
 # Grava a reuniao inteira NA PROPRIA MAQUINA (nada sai pra nuvem):
 #   - audio do SISTEMA (o que os outros falam) via NAudio
-#     WasapiLoopbackCapture -> sys.wav  (pega o endpoint de render,
-#     entao funciona ate de fone de ouvido).
+#     WasapiLoopbackCapture -> sys.wav  (pega o endpoint de Communications,
+#     entao captura o audio dos outros mesmo quando no fone/headset).
 #   - MICROFONE (voce) via NAudio WaveInEvent -> mic.wav
 #   - mixa+normaliza com ffmpeg -> out.wav (16 kHz mono)
 #   - transcreve local com whisper.cpp (mesmo padrao do
@@ -36,9 +47,13 @@ $MeetingsDir = Join-Path $Root "Meetings"
 $LibDir      = Join-Path $Root "lib"
 $NAudioDll   = Join-Path $LibDir "NAudio.dll"
 
-$WhisperDir = "C:\whisper"
+# Prefere uma copia LOCAL do whisper (dentro do SecondBrain, no perfil do
+# usuario) que NAO sofre o Deny herdado do C:\ corporativo. Se nao existir,
+# cai no C:\whisper de sempre.
+$LocalWhisper = Join-Path $Root "whisper"
+$WhisperDir = if (Test-Path (Join-Path $LocalWhisper "Release\whisper-cli.exe")) { $LocalWhisper } else { "C:\whisper" }
 $Model      = "ggml-medium.bin"
-$Lang       = "auto"
+$Lang       = "pt"
 $Threads    = 8
 
 # Nome do dispositivo dshow para o modo degradado (so-microfone).
@@ -46,9 +61,13 @@ $DshowMic   = 'Microphone Array (Intel Smart Sound)'
 
 New-Item -ItemType Directory -Path $MeetingsDir -Force | Out-Null
 
+$LogFile = Join-Path $MeetingsDir "record-log.txt"
 function Log([string]$Text) {
-    [Console]::Error.WriteLine("[$((Get-Date).ToString('HH:mm:ss'))] $Text")
+    $line = "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] $Text"
+    [Console]::Error.WriteLine($line)
+    try { [IO.File]::AppendAllText($LogFile, $line + "`r`n", [Text.Encoding]::UTF8) } catch {}
 }
+Log "=== record-meeting iniciado (Label='$Label', MaxMinutes=$MaxMinutes, StopFlag='$StopFlag', KeepAudio=$KeepAudio) ==="
 
 # ---- Descoberta de ferramentas (mesmo padrao do whatsapp-transcribe.ps1) -----
 function Resolve-Whisper {
@@ -194,7 +213,11 @@ public class SbDualRecorder
     public void Start(string sysPath, string micPath)
     {
         try {
-            sysCap = new WasapiLoopbackCapture();
+            // Usa o device de Communications (fone/headset) em vez do Multimedia default,
+            // para capturar o audio dos outros quando o usuario esta no fone.
+            var _en = new MMDeviceEnumerator();
+            var _commDev = _en.GetDefaultAudioEndpoint(DataFlow.Render, Role.Communications);
+            sysCap = new WasapiLoopbackCapture(_commDev);
             sysWriter = new WaveFileWriter(sysPath, sysCap.WaveFormat);
             sysCap.DataAvailable += (s, e) => { if (sysWriter != null) sysWriter.Write(e.Buffer, 0, e.BytesRecorded); };
             sysCap.RecordingStopped += (s, e) => { if (sysWriter != null) { sysWriter.Dispose(); sysWriter = null; } SysDone = true; try { sysCap.Dispose(); } catch {} };
@@ -309,17 +332,22 @@ function Has-Audio([string]$Path) {
 if ($recordedWithNAudio) {
     $haveSys = Has-Audio $sysWav
     $haveMic = Has-Audio $micWav
+    $sysSize = if ($haveSys) { (Get-Item $sysWav).Length } else { 0 }
+    $micSize = if ($haveMic) { (Get-Item $micWav).Length } else { 0 }
+    $sysKb = [math]::Round($sysSize / 1024)
+    $micKb = [math]::Round($micSize / 1024)
+    Log "Tamanho capturado - sistema: $sysKb KB / microfone: $micKb KB"
     try {
         if ($haveSys -and $haveMic) {
-            & $ffmpeg -y -hide_banner -loglevel error -i $micWav -i $sysWav -filter_complex "amix=inputs=2:duration=longest" -ar 16000 -ac 1 $outWav 2>$null
+            & $ffmpeg -y -hide_banner -i $micWav -i $sysWav -filter_complex "amix=inputs=2:duration=longest" -ar 16000 -ac 1 $outWav 2>&1 | ForEach-Object { Log "ffmpeg: $_" }
         }
         elseif ($haveMic) {
             Log "Sem audio de sistema utilizavel; mixando so o microfone."
-            & $ffmpeg -y -hide_banner -loglevel error -i $micWav -ar 16000 -ac 1 $outWav 2>$null
+            & $ffmpeg -y -hide_banner -i $micWav -ar 16000 -ac 1 $outWav 2>&1 | ForEach-Object { Log "ffmpeg: $_" }
         }
         elseif ($haveSys) {
             Log "Sem audio de microfone utilizavel; mixando so o audio do sistema."
-            & $ffmpeg -y -hide_banner -loglevel error -i $sysWav -ar 16000 -ac 1 $outWav 2>$null
+            & $ffmpeg -y -hide_banner -i $sysWav -ar 16000 -ac 1 $outWav 2>&1 | ForEach-Object { Log "ffmpeg: $_" }
         }
         else {
             Log "ERRO: nenhum audio foi capturado."
@@ -351,18 +379,27 @@ elseif (-not $modelPath) { Log "AVISO: modelo '$Model' nao encontrado (rode setu
 else {
     Log "whisper: $whisper"
     Log "modelo : $modelPath"
-    Log "Transcrevendo (pode demorar em reunioes longas)..."
     $outBase = Join-Path $env:TEMP ("mtg-$tmpStamp")
     $txtFile = "$outBase.txt"
-    # 2>&1 | Out-Null e o try/catch protegem contra $ErrorActionPreference="Stop"
-    # converter stderr do exe nativo em error record terminante (bug PS5.1).
-    try { & $whisper -m $modelPath -f $outWav -l $Lang -t $Threads -otxt -of $outBase -nt -np 2>&1 | Out-Null }
-    catch { Log "AVISO: whisper encerrou com erro (pode haver transcricao parcial): $($_.Exception.Message)" }
+    $outWavKb = if (Test-Path $outWav) { [math]::Round((Get-Item $outWav).Length / 1024) } else { 0 }
+    Log "Transcrevendo outWav ($outWavKb KB, pode demorar em reunioes longas)..."
+    # -l auto nao e suportado por todas as builds do whisper.cpp.
+    # Sem -l, o whisper detecta o idioma automaticamente (comportamento default).
+    $langArgs = if ($Lang -and $Lang -ne "auto") { @("-l", $Lang) } else { @() }
+    # Suspende Stop temporariamente para que stderr do exe nativo nao vire
+    # error record terminante no PS5.1 (bug com $ErrorActionPreference="Stop").
+    $prevEA = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+    try { & $whisper -m $modelPath -f $outWav @langArgs -t $Threads -otxt -mc 0 -of $outBase -nt 2>&1 | ForEach-Object { Log "whisper: $_" } }
+    catch { Log "AVISO: whisper encerrou com excecao PS: $($_.Exception.Message)" }
+    finally { $ErrorActionPreference = $prevEA }
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { Log "AVISO: whisper saiu com codigo $LASTEXITCODE." }
     if (Test-Path $txtFile) {
         $transcript = ((Get-Content $txtFile -Raw -Encoding UTF8) -replace '\s+', ' ').Trim()
         Remove-Item $txtFile -Force -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($transcript)) { Log "AVISO: whisper gerou arquivo mas sem texto (sem fala detectada)." }
+        else { $tlen = $transcript.Length; Log "Transcricao ok ($tlen chars)." }
     }
-    else { Log "AVISO: whisper nao gerou transcricao." }
+    else { Log "AVISO: whisper nao gerou transcricao (txtFile esperado: $txtFile)." }
 }
 
 # ============================================================
@@ -397,8 +434,15 @@ $sidecar = [pscustomobject]@{
 }
 [IO.File]::WriteAllText($jsonPath, ($sidecar | ConvertTo-Json -Depth 10), [Text.Encoding]::UTF8)
 
-# limpa temporarios
-Remove-Item $outWav -Force -ErrorAction SilentlyContinue
+# limpa temporarios; preserva o WAV se a transcricao ficou vazia (permite reprocessar)
+$keepOrphan = [string]::IsNullOrWhiteSpace($transcript) -and -not $KeepAudio
+if ($keepOrphan) {
+    $orphanWav = Join-Path $MeetingsDir "$baseName.wav"
+    try { Move-Item $outWav $orphanWav -Force; Log "AVISO: transcricao vazia - WAV preservado para reprocessar: $orphanWav" }
+    catch { Remove-Item $outWav -Force -ErrorAction SilentlyContinue }
+} else {
+    Remove-Item $outWav -Force -ErrorAction SilentlyContinue
+}
 if ($StopFlag -and (Test-Path $StopFlag)) { Remove-Item $StopFlag -Force -ErrorAction SilentlyContinue }
 
 Log "Pronto. Transcricao: $txtPath"

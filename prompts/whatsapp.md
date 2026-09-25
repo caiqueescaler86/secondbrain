@@ -41,6 +41,11 @@ Regra de omissão:
 - Nunca inclua itens com `proxima_acao` = "nenhuma ação pendente", "nenhuma", "n/a" ou similar.
 - Se não houver nada relevante no período inteiro: [].
 
+Pendências JÁ abertas (para NÃO duplicar):
+{{ABERTAS}}
+- Se uma conversa se refere a uma pendência já listada acima, REUTILIZE exatamente o mesmo texto de `assunto` e o mesmo `pessoa` da lista — assim o sistema reconhece como o MESMO item e não cria duplicata. Não reescreva com outras palavras.
+- Só crie um item novo para assuntos genuinamente novos (que não estão na lista acima).
+
 Ao resolver datas relativas ("sexta", "amanhã", "dia 25"), use a data atual acima como referência.
 - status: "responder", "cobrar", "aguardando", "fazer", "risco", "referencia".
 - tipo: "pessoal" ou "trabalho".

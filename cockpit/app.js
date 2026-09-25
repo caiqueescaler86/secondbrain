@@ -33,10 +33,23 @@ const el = (tag, cls, txt) => {
   if (txt != null) n.textContent = txt;
   return n;
 };
-const todayStr = () => new Date().toISOString().slice(0, 10);
+// Data de HOJE no fuso LOCAL (mesma base do backend, que grava createdAt/dueDate
+// com hora local). NAO usar toISOString(): ele converte pra UTC e, no Brasil
+// (UTC-3), "vira" o dia seguinte a partir das 21h -> "hoje" ficaria errado.
+const todayStr = () => {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+};
+
+// Card criado HOJE (base local). Estavel: nao depende de "ja visto".
+const isCreatedToday = t => (t.createdAt || "").slice(0, 10) === todayStr();
+
+// "Novo pendente" = criado hoje, ainda aberto E que voce ainda NAO mexeu.
+// (userTouched vem do backend quando voce edita/anota/conclui/adia -> ja foi tratado.)
+const isNovoPendente = t => isCreatedToday(t) && !t.done && !t.userTouched;
 
 // Card criado HOJE e ainda nao reconhecido pelo usuario (abrir o card "quita" o aviso).
-const isNew = t => !t.done && (t.createdAt || "").slice(0, 10) === todayStr() && !STATE.seen.has(t.sbid);
+const isNew = t => !t.done && isCreatedToday(t) && !t.userTouched && !STATE.seen.has(t.sbid);
 
 // normaliza texto p/ comparacao: minusculo, sem acento, espacos colapsados
 const normalize = s => (s || "").toString().toLowerCase()
@@ -193,6 +206,7 @@ function visible(task) {
 // especial de duplicados).
 function matchFilter(task, f) {
   if (f.dupes) return f.ids && f.ids.has(task.sbid);
+  if (f.novo && !isCreatedToday(task)) return false;   // filtro rapido "novos de hoje"
   if (f.pessoa && !normalize(task.pessoa).includes(normalize(f.pessoa))) return false;
   if (f.texto) {
     const hay = normalize([task.pessoa, task.assunto, task.resumo, task.proxima_acao].filter(Boolean).join(" "));
@@ -222,10 +236,25 @@ function matchFilter(task, f) {
 function updateStats() {
   const t = todayStr();
   const open = STATE.tasks.filter(x => !x.done);
-  $("#stat-hoje").textContent = open.filter(x => x.dueDate === t).length;
+  const hoje = open.filter(x => x.dueDate === t).length;
+  $("#stat-hoje").textContent = hoje;
+  const hojeWrap = $("#stat-hoje-wrap");
+  if (hojeWrap) {
+    hojeWrap.classList.toggle("empty", hoje === 0);
+    hojeWrap.classList.toggle("active", !!(STATE.filter && STATE.filter.prazo === "hoje"));
+  }
   $("#stat-atrasadas").textContent = open.filter(x => x.dueDate && x.dueDate < t).length;
   $("#stat-aguardando").textContent = open.filter(x => x.categoria === "aguardando").length;
   $("#stat-total").textContent = open.length;
+
+  // "novos": criados hoje e ainda abertos. Clicavel -> filtra a tela.
+  const novos = open.filter(isCreatedToday).length;
+  const wrap = $("#stat-novos-wrap");
+  if (wrap) {
+    $("#stat-novos").textContent = novos;
+    wrap.classList.toggle("empty", novos === 0);
+    wrap.classList.toggle("active", !!(STATE.filter && STATE.filter.novo));
+  }
 }
 
 // ---------- render ----------
@@ -321,7 +350,9 @@ function renderCard(task) {
   top.appendChild(el("span", "badge st-" + (task.status || "x"), PREFIX[task.status] || task.status || "•"));
   if (task.prioridade) top.appendChild(el("span", "badge " + task.prioridade, task.prioridade));
   // Badge "novo": card criado hoje e ainda nao aberto pelo usuario.
+  // "hoje": criado hoje mas ja reconhecido/mexido -> marcador persistente do dia.
   if (isNew(task)) top.appendChild(el("span", "badge novo", "novo"));
+  else if (isCreatedToday(task)) top.appendChild(el("span", "badge hoje", "hoje"));
   // Em modo duplicados, marca a qual grupo o card pertence.
   if (STATE.filter && STATE.filter.dupes && STATE.filter.groupOf) {
     const gi = STATE.filter.groupOf[task.sbid];
@@ -390,12 +421,13 @@ function renderCard(task) {
     const isOpen = card.classList.toggle("open");
     if (isOpen) {
       STATE.open.add(task.sbid);
-      // "Reconhece" o card novo: remove o realce visual sem precisar recriar o board.
+      // "Reconhece" o card novo: remove o realce verde e troca o badge "novo"
+      // pelo "hoje" (marcador do dia persiste), sem recriar o board.
       if (card.classList.contains("is-new")) {
         STATE.seen.add(task.sbid);
         card.classList.remove("is-new");
         const badgeNovo = card.querySelector(".badge.novo");
-        if (badgeNovo) badgeNovo.remove();
+        if (badgeNovo) { badgeNovo.className = "badge hoje"; badgeNovo.textContent = "hoje"; }
       }
     } else {
       STATE.open.delete(task.sbid);
@@ -953,6 +985,35 @@ function applyDuplicatesFilter() {
 $("#search").addEventListener("input", e => { STATE.search = e.target.value.trim(); render(); });
 $("#show-done").addEventListener("change", e => { STATE.showDone = e.target.checked; render(); });
 $("#refresh").addEventListener("click", load);
+
+// filtro rapido "novos": clica no stat -> mostra so os criados hoje; clica de novo limpa.
+const novosWrap = $("#stat-novos-wrap");
+const toggleNovos = () => {
+  if (STATE.filter && STATE.filter.novo) { clearFilter(); return; }
+  if (novosWrap && novosWrap.classList.contains("empty")) return;  // sem novos: nada a filtrar
+  applyFilter({ novo: true, resumo: "novos de hoje" });
+};
+if (novosWrap) {
+  novosWrap.addEventListener("click", toggleNovos);
+  novosWrap.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleNovos(); }
+  });
+}
+
+// filtro rapido "hoje": clica no stat -> mostra so os cards com PRAZO para hoje
+// (dueDate == hoje); clica de novo limpa. Nao confundir com "novos" (criados hoje).
+const hojeWrap = $("#stat-hoje-wrap");
+const toggleHoje = () => {
+  if (STATE.filter && STATE.filter.prazo === "hoje") { clearFilter(); return; }
+  if (hojeWrap && hojeWrap.classList.contains("empty")) return;  // nada com prazo hoje
+  applyFilter({ prazo: "hoje", resumo: "prazo para hoje" });
+};
+if (hojeWrap) {
+  hojeWrap.addEventListener("click", toggleHoje);
+  hojeWrap.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleHoje(); }
+  });
+}
 $("#expand-all").addEventListener("click", toggleExpandAll);
 $("#sort-prio").addEventListener("click", () => setSort("prio"));
 $("#sort-date").addEventListener("click", () => setSort("data"));

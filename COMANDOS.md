@@ -60,6 +60,14 @@ rodada (`secondbrain`); os comandos abaixo são só para setup/teste.
 |---|---|
 | `whisper-setup` | **Uma vez.** Baixa o whisper.cpp + o modelo `medium` (~1,5 GB) para `C:\whisper\`. |
 | `whatsapp-transcreve` | Transcreve os áudios que estão em `WhatsApp\audio-inbox\` e adiciona à base. |
+| `.\test-audio-recovery.ps1` | **Teste manual.** Transcreve o inbox e mostra as novas linhas de áudio + faixa de datas. Use `-RunExtractor -Days 8` para também rodar o extrator (scroll-up ao vivo) e validar o recovery de áudio antigo após uma folga. |
+
+> **Recovery de áudio após folga:** o `whatsapp-audio.ps1` agora **rola o histórico**
+> (scroll-up) na mesma janela do texto, então recupera notas de voz antigas, não só as
+> "1-2 dias" visíveis. Se um chat tem muitos áudios, cada rodada avança um bloco
+> (`MaxAudiosPerChat`) e a próxima continua de onde parou (dedup por hash). O status
+> fica em `WhatsApp\whatsapp-audio-recovery-state.json`.
+
 
 > **Como os áudios chegam:** na rodada, o `whatsapp-audio.ps1` puxa as notas de voz
 > do WhatsApp Web pra `audio-inbox\` (best-effort). Se algum áudio não vier automático,
@@ -90,7 +98,9 @@ Nada seu e aberto fica escondido num canto.
   embaixo (clique no título pra abrir/fechar).
 - **Clicar no card** → expande resumo, risco, notas e os botões.
 - Cards **criados hoje e ainda não abertos** ganham badge **"novo"** + realce verde —
-  abrir o card quita o destaque (útil pra ver o que cada rodada trouxe).
+  abrir o card quita o realce e o badge vira **"hoje"** (marcador discreto que persiste
+  o dia todo, útil pra ver a leva de cada rodada). O stat **"novos"** no topo é clicável
+  (filtra só os de hoje) e **não conta** cards que você já mexeu ou concluiu.
 - **✓ (canto sup. esq. do card)** → conclui em 1 clique sem expandir · confete 🎉 e elogio no toast.
 - **Feito** → mesmo efeito de dentro do card · **Adiar** → joga pra amanhã · **↑↓ Prio** → cicla prioridade.
 - **Notas** → digita direto no card (salva ao sair do campo, **sem piscar a tela**).
@@ -228,7 +238,11 @@ C:\Users\I827769\Documents\Joule\SecondBrain\
 │   ├─ joule.md            ← e-mail + calendário  ({{JANELA}})
 │   ├─ copilot.md          ← Teams + transcrições ({{JANELA}})
 │   └─ whatsapp.md         ← WhatsApp             ({{HOJE}} {{HORA}} {{DIAS}})
-├─ analyze-whatsapp.ps1    ← análise do WhatsApp pela LLM local (em lotes)
+├─ analyze-whatsapp.ps1    ← análise do WhatsApp pela LLM local (em lotes; cursor por offset)
+├─ whatsapp-collector.ps1  ← coleta mensagens (scroll até cutoff/topo; gate anti-perda)
+├─ whatsapp-audio.ps1      ← extrai notas de voz (scroll-up + fallbacks + gate de silêncio)
+├─ whatsapp-transcribe.ps1 ← transcreve o audio-inbox\ com whisper → append no .jsonl
+├─ test-audio-recovery.ps1 ← teste manual do recovery de áudio (L/M; rodar no seu terminal)
 ├─ start-llama.ps1         ← sobe o llama-server local (auto-start no logon, idempotente)
 ├─ meeting-detector.ps1    ← canal: ingere transcrições de reunião → cards
 ├─ meeting-watch.ps1       ← vigia: detecta reunião ao vivo e dispara a gravação
@@ -247,6 +261,13 @@ C:\Users\I827769\Documents\Joule\SecondBrain\
 ├─ processed\
 │   ├─ tasks.json          ← suas tarefas (o "banco" local)
 │   └─ last-run.json       ← timestamp do último run bem-sucedido (controla janela de busca)
+├─ WhatsApp\
+│   ├─ whatsapp-messages.jsonl            ← base append-only (mensagens + transcrições)
+│   ├─ whatsapp-state.json                ← checkpoint da COLETA (lastSuccessfulRun)
+│   ├─ whatsapp-analysis-state.json       ← checkpoint da ANÁLISE (analysisOffset + pendingUpperBound)
+│   ├─ whatsapp-audio-recovery-state.json ← checkpoint do ÁUDIO (separado do transcritor)
+│   ├─ whatsapp-audio-state.json          ← dedup do transcritor (áudios já transcritos)
+│   └─ audio-inbox\                       ← .ogg + sidecar .json aguardando transcrição
 ├─ raw\                    ← saída crua de cada canal por rodada
 └─ logs\                   ← run-<data>.log de cada rodada
 ```

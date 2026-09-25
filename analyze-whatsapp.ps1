@@ -15,7 +15,10 @@ param(
     [int]$TimeoutSec = 900,
     [string]$ApiKey = "",
     [switch]$Json,
-    [switch]$Save
+    [switch]$Save,
+    [switch]$UseOffset,
+    [string]$AnalysisStateFile = "",
+    [string]$OpenContextFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,6 +64,48 @@ if (-not (Test-Path $MessagesFile)) {
     throw "Base nao encontrada: $MessagesFile. Rode o whatsapp-collector.ps1 primeiro."
 }
 
+# --- Cursor por OFFSET (modo incremental do orquestrador) -------------------
+# O offset e a contagem de linhas do .jsonl (append-only) ja analisadas com
+# sucesso. Processa EXCLUSIVAMENTE as linhas de indice (analysisOffset, upperBound];
+# upperBound e CONGELADO agora, entao linhas anexadas durante a analise ficam pra
+# proxima rodada. O analyzer NAO commita o offset (CORRECAO 2): apenas grava
+# pendingUpperBound; quem promove analysisOffset e o secondbrain-run.ps1, depois
+# de persistir/consolidar os itens com sucesso.
+$analysisOffset = 0
+$upperBound = 0
+if ($UseOffset) {
+    if ([string]::IsNullOrWhiteSpace($AnalysisStateFile)) {
+        $AnalysisStateFile = Join-Path $BaseDir "whatsapp-analysis-state.json"
+    }
+    if (Test-Path $AnalysisStateFile) {
+        try {
+            $st = Get-Content $AnalysisStateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $st.analysisOffset) { $analysisOffset = [int]$st.analysisOffset }
+        } catch { Log "AVISO: analysis-state ilegivel; assumindo offset=0 (reanalisa; dedup por SBID protege)." Yellow }
+    } else {
+        Log "AVISO: $AnalysisStateFile inexistente; offset=0 (reanalisa tudo; rode a migracao). Dedup por SBID protege." Yellow
+    }
+    # upperBound = nº de linhas nao-vazias AGORA (mesma semantica da migracao).
+    foreach ($l in [System.IO.File]::ReadLines($MessagesFile)) {
+        if (-not [string]::IsNullOrWhiteSpace($l)) { $upperBound++ }
+    }
+    $novas = [math]::Max(0, $upperBound - $analysisOffset)
+    Log "Cursor por offset: analysisOffset=$analysisOffset upperBound=$upperBound (novas: $novas)." Cyan
+}
+
+# Grava SOMENTE pendingUpperBound (CORRECAO 2); nunca toca em analysisOffset.
+function Save-AnalysisPending([int]$Upper) {
+    if (-not $UseOffset) { return }
+    $obj = $null
+    if (Test-Path $AnalysisStateFile) { try { $obj = Get-Content $AnalysisStateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {} }
+    if (-not $obj) { $obj = [pscustomobject]@{ version = 1; analysisOffset = 0 } }
+    $obj | Add-Member -NotePropertyName pendingUpperBound -NotePropertyValue $Upper -Force
+    $obj | Add-Member -NotePropertyName updatedAt -NotePropertyValue ((Get-Date).ToString("o")) -Force
+    # UTF-8 SEM BOM (consistente com o arquivo da migracao).
+    [IO.File]::WriteAllText($AnalysisStateFile, ($obj | ConvertTo-Json -Depth 10), (New-Object Text.UTF8Encoding $false))
+    Log "analysis-state: pendingUpperBound=$Upper gravado (offset sera promovido pelo secondbrain-run apos consolidar)." DarkGray
+}
+
 # --- Carrega e filtra as mensagens ------------------------------------------
 $cutoff = (Get-Date).AddDays(-$Days)
 
@@ -77,35 +122,78 @@ Log "Lendo base e filtrando ultimos $Days dias (a partir de $($cutoff.ToString('
 
 $records = New-Object System.Collections.ArrayList
 $total = 0
+$withTs = 0; $withoutTs = 0; $ignoredNoContent = 0
 
-foreach ($line in [System.IO.File]::ReadLines($MessagesFile)) {
-    if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $total++
-    try { $r = $line | ConvertFrom-Json } catch { continue }
+if ($UseOffset) {
+    # Modo incremental: seleciona (analysisOffset, upperBound] por INDICE de linha,
+    # independente de timestamp (§13). Nao descarta linha util so por faltar hora;
+    # ordena/rotula por timestamp de envio quando houver, senao por capturedAt.
+    $idx = 0
+    foreach ($line in [System.IO.File]::ReadLines($MessagesFile)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $idx++
+        if ($idx -le $analysisOffset) { continue }   # ja analisada
+        if ($idx -gt $upperBound) { break }          # anexada apos o freeze -> proxima rodada
+        $total++
+        try { $r = $line | ConvertFrom-Json } catch { continue }
 
-    if (-not $r.timestamp) { continue }
-    $dt = $null
-    try { $dt = [datetimeoffset]::Parse([string]$r.timestamp) } catch {}
-    if (-not $dt) { continue }
-    if ($dt.LocalDateTime -lt $cutoff) { continue }
-    # Marca d'agua: descarta mensagens ja processadas na ultima analise bem-sucedida.
-    if ($sinceOffset -and $dt -le $sinceOffset) { continue }
+        $dt = $null; $hadTs = $false
+        if ($r.timestamp) { try { $dt = [datetimeoffset]::Parse([string]$r.timestamp); $hadTs = $true } catch {} }
+        if (-not $dt -and $r.capturedAt) { try { $dt = [datetimeoffset]::Parse([string]$r.capturedAt) } catch {} }
+        if (-not $dt) { $dt = [datetimeoffset]::Now }
 
-    if ($OnlyChat -and ([string]$r.chat) -notlike "*$OnlyChat*") { continue }
-    if ([string]::IsNullOrWhiteSpace([string]$r.text)) { continue }
+        if ($OnlyChat -and ([string]$r.chat) -notlike "*$OnlyChat*") { continue }
+        if ([string]::IsNullOrWhiteSpace([string]$r.text)) { $ignoredNoContent++; continue }
 
-    [void]$records.Add([pscustomobject]@{
-        chat      = [string]$r.chat
-        dt        = $dt
-        author    = [string]$r.author
-        direction = [string]$r.direction
-        text      = (([string]$r.text) -replace '\s+', ' ')
-    })
+        if ($hadTs) { $withTs++ } else { $withoutTs++ }
+        [void]$records.Add([pscustomobject]@{
+            chat      = [string]$r.chat
+            dt        = $dt
+            author    = [string]$r.author
+            direction = [string]$r.direction
+            text      = (([string]$r.text) -replace '\s+', ' ')
+        })
+    }
+    Log "Offset ($analysisOffset, $upperBound]: $($records.Count) p/ analisar (comTimestamp=$withTs semTimestamp=$withoutTs; ignoradas s/ conteudo=$ignoredNoContent)." Gray
+}
+else {
+    foreach ($line in [System.IO.File]::ReadLines($MessagesFile)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $total++
+        try { $r = $line | ConvertFrom-Json } catch { continue }
+
+        if (-not $r.timestamp) { continue }
+        $dt = $null
+        try { $dt = [datetimeoffset]::Parse([string]$r.timestamp) } catch {}
+        if (-not $dt) { continue }
+        if ($dt.LocalDateTime -lt $cutoff) { continue }
+        # Marca d'agua: descarta mensagens ja processadas na ultima analise bem-sucedida.
+        if ($sinceOffset -and $dt -le $sinceOffset) { continue }
+
+        if ($OnlyChat -and ([string]$r.chat) -notlike "*$OnlyChat*") { continue }
+        if ([string]::IsNullOrWhiteSpace([string]$r.text)) { continue }
+
+        [void]$records.Add([pscustomobject]@{
+            chat      = [string]$r.chat
+            dt        = $dt
+            author    = [string]$r.author
+            direction = [string]$r.direction
+            text      = (([string]$r.text) -replace '\s+', ' ')
+        })
+    }
+    Log "Base: $total linhas. No periodo: $($records.Count) mensagens." Gray
 }
 
-Log "Base: $total linhas. No periodo: $($records.Count) mensagens." Gray
-
 if ($records.Count -eq 0) {
+    if ($UseOffset) {
+        # 0 novas linhas com conteudo: NAO chama a LLM. Marca pendingUpperBound
+        # (consome ate upperBound, inclusive linhas sem conteudo ja varridas) e
+        # emite lista vazia — o orquestrador trata como OK (0 itens).
+        Save-AnalysisPending $upperBound
+        Log "0 novas mensagens/transcricoes para analisar (offset=$analysisOffset, upperBound=$upperBound)." Green
+        if ($Json) { Write-Output "[]"; return }
+        Write-Host "Nada novo para analisar."; return
+    }
     throw "Nenhuma mensagem no periodo. Aumente -Days ou rode o coletor."
 }
 
@@ -168,10 +256,20 @@ if ($Json) {
     if (Test-Path $waPromptFile) {
         $hoje = (Get-Date).ToString("dd/MM/yyyy")
         $hora = (Get-Date).ToString("HH:mm")
+        # Contexto de dedup (pendencias abertas) -> {{ABERTAS}}. Sem arquivo/vazio
+        # => texto neutro (o placeholder some sem quebrar o prompt).
+        $abertas = "(nenhuma pendencia aberta ainda)"
+        if ($OpenContextFile -and (Test-Path $OpenContextFile)) {
+            try {
+                $tmp = (Get-Content $OpenContextFile -Raw -Encoding UTF8)
+                if (-not [string]::IsNullOrWhiteSpace($tmp)) { $abertas = $tmp }
+            } catch {}
+        }
         $system = (Get-Content $waPromptFile -Raw -Encoding UTF8) `
                   -replace '\{\{HOJE\}\}', $hoje `
                   -replace '\{\{HORA\}\}', $hora `
-                  -replace '\{\{DIAS\}\}', [string]$Days
+                  -replace '\{\{DIAS\}\}', [string]$Days `
+                  -replace '\{\{ABERTAS\}\}', $abertas
     } else {
         # Fallback: instrucoes minimas caso o template nao exista.
         $system = @"
@@ -406,6 +504,10 @@ if ($Json) {
         Log "Salvo em: $outFile" Green
     }
 
+    # Analise concluida: registra pendingUpperBound (CORRECAO 2 — NAO promove o
+    # offset; o secondbrain-run.ps1 promove analysisOffset apos persistir/consolidar).
+    Save-AnalysisPending $upperBound
+
     # UNICA saida no stdout: o JSON.
     Write-Output $clean
     return
@@ -420,3 +522,6 @@ if ($Save) {
     [System.IO.File]::WriteAllText($outFile, $header + $answer, [Text.Encoding]::UTF8)
     Log "Salvo em: $outFile" Green
 }
+
+# Caminho nao-Json com -UseOffset (invocacao manual): tambem registra o cursor.
+if ($UseOffset) { Save-AnalysisPending $upperBound }

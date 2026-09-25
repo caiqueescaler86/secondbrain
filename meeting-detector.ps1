@@ -126,19 +126,25 @@ function Get-JsonItems([string]$text) {
 $sysPrompt = @"
 Voce e um extrator de action items de transcricoes de reuniao. Responda SOMENTE com um array JSON valido, sem texto antes/depois, sem cercas de codigo.
 Regras:
+- FILTRO PRINCIPAL: inclua APENAS itens onde o responsavel seja "Caique" (ou "eu"), ou onde Caique foi explicitamente mencionado/solicitado, ou que envolvam diretamente o produto/conta Emarsys.
+- Ignore completamente acoes atribuidas a outras pessoas que nao envolvam Caique ou Emarsys.
+- Em reunioes de status geral com muitos participantes, seja conservador: so inclua o que requer acao real de Caique ou impacta Emarsys.
 - Extraia apenas o que exige acao: tarefas, followups, decisoes, prazos, riscos, quem vai fazer o que.
 - Nao invente. Se faltar informacao, use null.
-- "eu" = a pessoa que gravou/participou da reuniao (dono da conta).
+- "eu" = Caique, a pessoa que gravou/participou da reuniao (dono da conta).
 - status: fazer|responder|cobrar|aguardando|risco|referencia.
 - tipo: pessoal|trabalho. prioridade: alta|media|baixa.
 - Ignore conversa social sem acao.
 - canal: sempre "meetings". fonte: sempre "transcricao".
+- Se nao houver nada acionavel para Caique/Emarsys, devolva [].
 "@
 
 $questionTpl = @"
-Analise a transcricao abaixo (reuniao: {{LABEL}}, data: {{DATA}}, duracao: ~{{DUR}} min) e devolva um array JSON. Cada item:
+Analise a transcricao abaixo (reuniao: {{LABEL}}, data: {{DATA}}, duracao: ~{{DUR}} min).
+Devolva um array JSON apenas com itens acionaveis para CAIQUE ou relacionados a EMARSYS. Ignore acoes de outros participantes que nao envolvam Caique diretamente.
+Cada item:
 {"canal":"meetings","tipo":"trabalho","pessoa":"Nome ou null","assunto":"curto","resumo":"1-2 frases","proxima_acao":"verbo + objeto","responsavel":"eu ou nome","status":"fazer|responder|cobrar|aguardando|risco|referencia","prazo":"YYYY-MM-DD ou null","prioridade":"alta|media|baixa","risco":"texto ou null","fonte":"transcricao","reuniao_em":null}
-Se nao houver nada acionavel, devolva [].
+Se nao houver nada acionavel para Caique/Emarsys, devolva [].
 "@
 
 # --- Processa cada sidecar --------------------------------------------------
@@ -158,10 +164,10 @@ foreach ($file in $toProcess) {
         } else { "desconhecida" }
 
         if ([string]::IsNullOrWhiteSpace($transcript)) {
-            Log "  $id: transcricao vazia — nada a analisar." Yellow
+            Log "  ${id}: transcricao vazia - nada a analisar." Yellow
         } else {
             $transcriptLen = $transcript.Length
-            Log "  $id: $transcriptLen chars, enviando ao LLM..." Gray
+            Log "  ${id}: $transcriptLen chars, enviando ao LLM..." Gray
 
             # Quebra em lotes se o transcript for maior que o budget
             $chunks = @()
@@ -180,7 +186,7 @@ foreach ($file in $toProcess) {
                 }
             }
 
-            Log "  $id: $($chunks.Count) lote(s)" Gray
+            Log "  ${id}: $($chunks.Count) lote(s)" Gray
             $meetingItems = New-Object System.Collections.ArrayList
             $ci = 0
             foreach ($chunk in $chunks) {
@@ -195,7 +201,7 @@ foreach ($file in $toProcess) {
                 Log "  Lote ${ci}: $(@($items).Count) item(ns)." Gray
             }
 
-            Log "  $id: $($meetingItems.Count) item(ns) extraidos." Green
+            Log "  ${id}: $($meetingItems.Count) item(ns) extraidos." Green
             foreach ($it in $meetingItems) { [void]$allItems.Add($it) }
         }
 
@@ -203,7 +209,7 @@ foreach ($file in $toProcess) {
         $state.processed | Add-Member -NotePropertyName $id -NotePropertyValue $true -Force
 
     } catch {
-        Log "  ERRO processando $id: $($_.Exception.Message)" Red
+        Log "  ERRO processando ${id}: $($_.Exception.Message)" Red
         # Nao marca como processado: nova tentativa na proxima rodada
     }
 }

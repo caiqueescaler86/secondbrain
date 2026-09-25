@@ -164,21 +164,28 @@ $proc        = $null
 $curLabel    = ""
 $releaseHits = 0        # polls consecutivos sem microfone (debounce de parada)
 $releaseNeed = 2        # exige 2 polls livres antes de parar
+$lastStart   = [datetime]::MinValue   # cooldown anti-restart-loop
 
 while ($true) {
     try {
-        # se estava gravando e o processo morreu sozinho (MaxMinutes/erro), reseta.
-        if ($recording -and $proc -and $proc.HasExited) {
-            Log "record-meeting encerrou por conta propria (exit=$($proc.ExitCode)). Pronto para a proxima."
-            $recording = $false; $stopFlag = $null; $proc = $null; $curLabel = ""
-            Save-WatchState $false $null 0 ""
+        # se estava gravando, verifica se o processo ainda existe pelo PID.
+        # Nao usa $proc.HasExited — pode ser impreciso no PS5.1 apos GC.
+        if ($recording -and $proc) {
+            $alive = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+            if (-not $alive) {
+                Log "record-meeting encerrou (pid=$($proc.Id)). Pronto para a proxima."
+                $recording = $false; $stopFlag = $null; $proc = $null; $curLabel = ""
+                Save-WatchState $false $null 0 ""
+            }
         }
 
         $micApp   = Get-LiveMicApp
         $micLive  = [bool]$micApp
 
         if (-not $recording) {
-            if ($micLive) {
+            # cooldown: so reinicia se passou mais de 30s desde o ultimo start
+            $cooldownOk = ((Get-Date) - $lastStart).TotalSeconds -gt 30
+            if ($micLive -and $cooldownOk) {
                 # deriva o label do assunto do calendario, se houver.
                 $label = "reuniao"
                 $subj  = Get-CalendarSubjectNow
@@ -198,16 +205,23 @@ while ($true) {
                     "-MaxMinutes", $MaxMinutes,
                     "-Label", $label,
                     "-StopFlag", $stopFlag
+                    # -KeepAudio removido: audio e deletado apos transcricao ok.
+                    # Se transcricao ficar vazia, record-meeting ja preserva o WAV
+                    # automaticamente em Meetings\<base>.wav para reprocessar.
                 )
                 try {
                     $proc = Start-Process -FilePath "powershell" -ArgumentList $recArgs -PassThru -WindowStyle Minimized
                     $recording = $true; $curLabel = $label; $releaseHits = 0
+                    $lastStart = Get-Date
                     Save-WatchState $true $stopFlag $proc.Id $label
                 }
                 catch {
                     Log "Falha ao iniciar record-meeting.ps1: $($_.Exception.Message)"
                     $stopFlag = $null; $proc = $null
                 }
+            }
+            elseif ($micLive -and -not $cooldownOk) {
+                Log "Mic ativo mas em cooldown ($([math]::Round(30 - ((Get-Date)-$lastStart).TotalSeconds))s restantes). Aguardando."
             }
         }
         else {
@@ -219,12 +233,14 @@ while ($true) {
                     if ($stopFlag) {
                         try { New-Item -ItemType File -Path $stopFlag -Force | Out-Null } catch {}
                     }
-                    # aguarda o record-meeting encerrar (mixa+transcreve).
+                    # aguarda o record-meeting encerrar (mixa+transcreve), max 5min.
                     $waited = 0
-                    while ($proc -and -not $proc.HasExited -and $waited -lt 300) {
+                    while ($proc -and $waited -lt 300) {
+                        $alive = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+                        if (-not $alive) { break }
                         Start-Sleep -Seconds 3; $waited += 3
                     }
-                    if ($proc -and -not $proc.HasExited) {
+                    if ($proc -and (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
                         Log "record-meeting ainda processando (transcricao longa); seguindo o monitoramento."
                     }
                     $recording = $false; $stopFlag = $null; $proc = $null; $curLabel = ""; $releaseHits = 0

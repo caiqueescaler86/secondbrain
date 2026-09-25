@@ -208,6 +208,37 @@ SecondBrain\
 > automaticamente a janela enviada ao Joule/Copilot (ex.: 5 dias parado → busca 5 dias,
 > não só 24h). Tetos: Joule 14 dias, Copilot 72h, WhatsApp 14 dias.
 
+### WhatsApp: leitura incremental por offset + recovery de texto e áudio
+
+Desde 24/09/2026 a **análise do WhatsApp usa um cursor por OFFSET de linha** no
+`WhatsApp\whatsapp-messages.jsonl` (append-only), não mais uma marca por timestamp.
+Motivo: ~25% das linhas não têm `timestamp` estruturado e o instante de *envio*
+confundia "recém-coletado" com "recém-enviado". O offset conta linhas (IDs 100%
+únicos; `capturedAt` 100% presente e monotônico com a ordem).
+
+Três checkpoints **independentes**, cada um só avança quando de fato completou:
+
+| Checkpoint | Arquivo | Avança quando |
+|---|---|---|
+| Coleta | `WhatsApp\whatsapp-state.json` (`lastSuccessfulRun`) | sidebar completa **e** todo chat fechou em CUTOFF ou TOPO real |
+| Áudio | `WhatsApp\whatsapp-audio-recovery-state.json` *(separado do transcritor)* | varredura completa e limpa **e sem** `MaxAudiosPerChat` batido |
+| Análise | `WhatsApp\whatsapp-analysis-state.json` (`analysisOffset`) | o `secondbrain-run.ps1` **consolidou** os itens com sucesso |
+
+- O analisador **não** commita o offset: grava só `pendingUpperBound`; quem promove
+  `analysisOffset = pendingUpperBound` é o orquestrador, **depois** de persistir o
+  `tasks.json`. Se a rodada falha em qualquer etapa, o offset **não** avança e o
+  mesmo lote é reprocessado (dedup por ID evita duplicata).
+- O **extrator de áudio agora rola o histórico** (scroll-up incremental na mesma
+  janela do texto, `-Days $waDays`), recuperando notas de voz antigas após uma folga —
+  não só as "1-2 dias" visíveis. Todos os fallbacks de aquisição e o gate de silêncio
+  seguem intactos.
+- **Recovery progressivo:** se um chat bate `MaxAudiosPerChat`, ele é marcado
+  incompleto e o checkpoint de áudio não avança; a próxima rodada refaz a janela e o
+  dedup por hash pula os `.ogg` já salvos, avançando nos próximos.
+
+> Os `.bak-*` dos estados foram gravados antes da migração. Rollback = restaurar o
+> `.bak-*` + `git checkout` dos scripts. Nunca apague o `whatsapp-messages.jsonl`.
+
 ---
 
 ## 5. O cockpit (`cockpit.ps1` + pasta `cockpit\`)

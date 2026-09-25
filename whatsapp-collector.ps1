@@ -527,6 +527,85 @@ function Scroll-ChatUp {
     return JSJson $code 8
 }
 
+# --- Detecção robusta do container rolável (probe6) -------------------------
+# Varre TODOS os div de #main pelo maior (scrollHeight-clientHeight) com
+# clientHeight>200. NAO sobe a partir de um elemento de mensagem (metodo antigo,
+# fragil: dava scrollTop=-1 / falso-topo na virtualizacao). Ver memoria
+# whatsapp-scroll-top-detection.
+function Measure-ChatScroll {
+    $code = @'
+(() => {
+ const clean=v=>(v||"").replace(/[‎‏‪-‮]/g,"").replace(/\s+/g," ").trim();
+ const main=document.querySelector("#main"); if(!main) return JSON.stringify({ok:false});
+ let sc=null,best=0; for(const e of main.querySelectorAll("div")){ const d=e.scrollHeight-e.clientHeight; if(d>best && e.clientHeight>200){best=d;sc=e;} }
+ const metas=[...main.querySelectorAll("[data-pre-plain-text]")];
+ const oldest = metas.length? clean(metas[0].getAttribute("data-pre-plain-text")) : "";
+ const spin = main.querySelector('[role="progressbar"], [data-icon="loading"], [aria-busy="true"]');
+ return JSON.stringify({ok:true,rendered:metas.length,oldest,
+   scrollable:!!sc, scrollTop: sc?Math.round(sc.scrollTop):0, scrollHeight: sc?sc.scrollHeight:0,
+   clientHeight: sc?sc.clientHeight:0, overflow: sc?(sc.scrollHeight-sc.clientHeight):0, spinner:!!spin });
+})()
+'@
+    return JSJson $code 10
+}
+
+function Scroll-ChatTop {
+    $code = @'
+(() => { const main=document.querySelector("#main"); if(!main) return "nomain"; let sc=null,best=0; for(const e of main.querySelectorAll("div")){ const d=e.scrollHeight-e.clientHeight; if(d>best && e.clientHeight>200){best=d;sc=e;} } if(!sc) return "noscroller"; sc.scrollTop=0; sc.dispatchEvent(new Event("scroll",{bubbles:true})); return String(Math.round(sc.scrollTop)); })()
+'@
+    return [string](JS $code 8)
+}
+
+# --- Sobe o historico do chat ate CUTOFF / topo real / teto -----------------
+# Retorna a CLASSE em 5 estados (probe6):
+#   CUTOFF_REACHED, HISTORY_TOP_REACHED  -> completo (permite avançar o marco)
+#   SCROLL_LIMIT_REACHED, CDP_ERROR, INDETERMINATE -> incompleto (bloqueia)
+# Topo real = scrollTop fixo <=5 + scrollHeight nao cresce + oldest nao avanca,
+# confirmado 3x, ciente de spinner (lazy-load). Ver whatsapp-scroll-top-detection.
+function Invoke-ChatScrollUntil([datetime]$Cutoff, [int]$MaxScrolls) {
+    $class = "INDETERMINATE"; $reason = ""; $done = 0
+    $prevOldest = ""; $pinnedStable = 0
+    try {
+        for ($k = 0; $k -le $MaxScrolls; $k++) {
+            $done = $k
+            $m = Measure-ChatScroll
+            if (-not $m -or -not $m.ok) { Start-Sleep -Milliseconds 500; $m = Measure-ChatScroll }
+            if (-not $m -or -not $m.ok) { $class = "CDP_ERROR"; $reason = "measure_null"; break }
+            $od = Parse-MetaDate ([string]$m.oldest)
+
+            if ($od -and $od -le $Cutoff) { $class = "CUTOFF_REACHED"; $reason = "oldest $($m.oldest)"; break }
+            # TOPO A: sem container rolavel MAS com mensagens = historico cabe na tela.
+            if ((-not [bool]$m.scrollable) -and [int]$m.rendered -gt 0) { $class = "HISTORY_TOP_REACHED"; $reason = "sem overflow + mensagens"; break }
+            if ((-not [bool]$m.scrollable) -and [int]$m.rendered -eq 0) { $class = "INDETERMINATE"; $reason = "sem container e sem mensagens"; break }
+
+            $shBefore = [int]$m.scrollHeight
+            Scroll-ChatTop | Out-Null
+            Start-Sleep -Milliseconds 1000
+            $m2 = Measure-ChatScroll
+            if (-not $m2 -or -not $m2.ok) { $class = "CDP_ERROR"; $reason = "measure2_null"; break }
+            $grew = ([int]$m2.scrollHeight -gt ($shBefore + 40))
+            $movedOldest = ([string]$m2.oldest -ne $prevOldest)
+            $pinned = ([int]$m2.scrollTop -le 5)
+            $busy = [bool]$m2.spinner
+            $prevOldest = [string]$m2.oldest
+            if ($busy) { Start-Sleep -Milliseconds 1200; $pinnedStable = 0; continue }
+            # TOPO B: preso no topo + scrollHeight estavel + oldest estavel -> 3x.
+            if ($pinned -and (-not $grew) -and (-not $movedOldest)) { $pinnedStable++ } else { $pinnedStable = 0 }
+            if ($pinnedStable -ge 3) { $class = "HISTORY_TOP_REACHED"; $reason = "scrollTop fixo em 0 + sH estavel + data estavel (3x)"; break }
+            if ($k -eq $MaxScrolls) {
+                if ($grew -or $movedOldest) { $class = "SCROLL_LIMIT_REACHED"; $reason = "ainda crescendo/movendo no teto ($MaxScrolls)" }
+                else { $class = "INDETERMINATE"; $reason = "estagnou sem confirmar topo" }
+                break
+            }
+            Start-Sleep -Milliseconds 250
+        }
+    } catch {
+        $class = "CDP_ERROR"; $reason = $_.Exception.Message
+        try { Ensure-Connected } catch {}
+    }
+    return [pscustomobject]@{ class = $class; reason = $reason; scrolls = $done }
+}
+
 function Collect-Loaded([string]$ChatName) {
     $safe = $ChatName | ConvertTo-Json -Compress
     $code = @"
@@ -662,6 +741,9 @@ try {
 
     $sidebarDone = $false
     $stagnantRounds = 0
+    # Gate do marco (§11): so avanca o lastSuccessfulRun se a varredura da sidebar
+    # terminou por fim-de-lista real E todo chat visitado fechou em CUTOFF/TOP.
+    $allChatsClean = $true
 
     while (-not $sidebarDone -and $seenChats.Count -lt $MaxChats) {
         try { $visible = @(Get-VisibleChats) }
@@ -686,43 +768,33 @@ try {
             $click = Click-Chat $name
             if (-not $click.ok) {
                 Log "Nao consegui abrir: $name" DarkYellow
+                $allChatsClean = $false
                 continue
             }
 
             if (-not (Wait-ChatMessages 2200)) {
                 Log "Sem mensagens detectaveis: $name" DarkYellow
+                $allChatsClean = $false
                 continue
             }
 
             Log "[$($seenChats.Count)] $name" Cyan
 
-            # Bootstrap sobe ate encontrar mensagem anterior ao cutoff.
-            # Delta sobe pouco e para assim que encontra a janela de overlap.
-            $scrollLimit = $(if ($isBootstrap) { $MaxScrollsPerChat } else { 12 })
-            $scrolls = 0
-            $reachedCutoff = $false
-            $lastOldest = ""
-
-            while ($scrolls -lt $scrollLimit) {
-                $oldestMeta = Get-OldestMeta
-                $oldestDate = Parse-MetaDate $oldestMeta
-
-                if ($oldestDate -and $oldestDate -le $cutoff) {
-                    $reachedCutoff = $true
-                    break
-                }
-
-                $scroll = Scroll-ChatUp
-                if (-not $scroll.moved) { break }
-
-                Start-Sleep -Milliseconds 260
-                $scrolls++
-
-                $newOldest = Get-OldestMeta
-                if ($newOldest -eq $lastOldest -and $newOldest) {
-                    Start-Sleep -Milliseconds 350
-                }
-                $lastOldest = $newOldest
+            # Sobe o historico ate CUTOFF / topo real / teto de seguranca, usando a
+            # deteccao robusta do probe6 (5 estados). Bootstrap mantem o teto 120;
+            # delta usa 45 (cobre ~8 dias no chat mais movimentado + overlap).
+            $scrollCap = $(if ($isBootstrap) { $MaxScrollsPerChat } else { 45 })
+            $scrollRes = $null
+            try { $scrollRes = Invoke-ChatScrollUntil $cutoff $scrollCap }
+            catch { Ensure-Connected; $scrollRes = [pscustomobject]@{ class = "CDP_ERROR"; reason = $_.Exception.Message; scrolls = 0 } }
+            $chatClass = [string]$scrollRes.class
+            $scrolls = [int]$scrollRes.scrolls
+            $reachedCutoff = ($chatClass -eq "CUTOFF_REACHED")
+            # So CUTOFF/TOP contam como varredura completa do chat; o resto bloqueia
+            # o avanco do marco (retry na proxima rodada, dedup cobre).
+            if ($chatClass -ne "CUTOFF_REACHED" -and $chatClass -ne "HISTORY_TOP_REACHED") {
+                $allChatsClean = $false
+                Log "  ${name}: scroll incompleto (${chatClass}: $($scrollRes.reason)) -> marco NAO avancara." DarkYellow
             }
 
             $raw = @(Collect-Loaded $name)
@@ -767,12 +839,15 @@ try {
                 added=$added
                 scrolls=$scrolls
                 reachedCutoff=$reachedCutoff
+                class=$chatClass
+                reason=[string]$scrollRes.reason
             })
 
-            Log "OK ${name}: loaded=$($raw.Count) | janela=$($messages.Count) | NOVAS=$added | scrolls=$scrolls" Green
+            Log "OK ${name}: loaded=$($raw.Count) | janela=$($messages.Count) | NOVAS=$added | scrolls=$scrolls | $chatClass" Green
           }
           catch {
             Log "Falha em ${name}: $($_.Exception.Message)" DarkYellow
+            $allChatsClean = $false
             Ensure-Connected
             continue
           }
@@ -789,9 +864,27 @@ try {
         }
     }
 
-    $state.bootstrapComplete = $true
-    $state.lastSuccessfulRun = (Get-Date).ToString("o")
-    Save-State $state
+    # §11 - GATE do marco. Varredura completa = sidebar terminou por fim-de-lista
+    # real (nao por MaxChats) E todo chat visitado fechou em CUTOFF/TOP. Alem
+    # disso exige ter visitado ao menos 1 chat (evita avancar num run vazio por
+    # falha de UI, que perderia a janela em silencio).
+    $sidebarTraversalComplete = ($sidebarDone -and $seenChats.Count -lt $MaxChats)
+    $canAdvance = ($sidebarTraversalComplete -and $allChatsClean -and $seenChats.Count -gt 0)
+
+    if ($canAdvance) {
+        $state.bootstrapComplete = $true
+        $state.lastSuccessfulRun = (Get-Date).ToString("o")
+        Save-State $state
+        Log "Marco AVANCADO: varredura completa e todos os chats em CUTOFF/TOP." Green
+    } else {
+        $why = if ($seenChats.Count -eq 0) { "nenhum chat visitado" }
+               elseif (-not $sidebarTraversalComplete) { "varredura da sidebar incompleta (MaxChats/erro)" }
+               else { "algum chat nao chegou a CUTOFF/TOP (SCROLL_LIMIT/CDP_ERROR/INDETERMINATE/open-fail)" }
+        # Persiste os estados por chat e mensagens ja anexadas, MAS mantem o
+        # watermark antigo -> proxima rodada refaz do mesmo ponto (dedup cobre).
+        Save-State $state
+        Log "Marco NAO avancado: $why. Proxima rodada refaz do mesmo watermark." Yellow
+    }
 
     $runSummary = [pscustomobject]@{
         version=9
@@ -801,6 +894,9 @@ try {
         cutoff=$cutoff.ToString("o")
         uniqueChatsVisited=$seenChats.Count
         newMessages=$totalAdded
+        sidebarTraversalComplete=$sidebarTraversalComplete
+        allChatsClean=$allChatsClean
+        markAdvanced=$canAdvance
         messagesFile=$MessagesFile
         stateFile=$StateFile
         chats=@($runResults)

@@ -2,7 +2,9 @@ param(
     [int]$Port      = 9224,
     [int]$Days      = 2,
     [int]$MaxChats  = 200,
-    [int]$MaxAudiosPerChat = 40
+    [int]$MaxAudiosPerChat = 40,
+    [string]$FirefoxExe     = "C:\Program Files\Mozilla Firefox\firefox.exe",
+    [string]$FirefoxProfile = "C:\Users\I827769\AppData\Roaming\Mozilla\Firefox\Profiles\qyl4c5lr.default-release"
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +31,11 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text
 $BaseDir    = Join-Path $env:USERPROFILE "Documents\Joule\SecondBrain\WhatsApp"
 $InboxDir   = Join-Path $BaseDir "audio-inbox"
 $AudioState = Join-Path $BaseDir "whatsapp-audio-state.json"
+# CORRECAO 3: checkpoint de recovery em arquivo SEPARADO. O whatsapp-audio-state.json
+# e do transcritor (Save-AudioState o regrava a cada audio). Aqui NUNCA escrevemos
+# nele; so LEMOS (via Load-ProcessedAudios) para dedup. O status da varredura de
+# recovery mora aqui:
+$AudioRecoveryState = Join-Path $BaseDir "whatsapp-audio-recovery-state.json"
 New-Item -ItemType Directory -Path $InboxDir -Force | Out-Null
 
 $script:ws = $null
@@ -49,6 +56,28 @@ function Test-Port {
         if (-not $a.AsyncWaitHandle.WaitOne(800)) { $c.Close(); return $false }
         $c.EndConnect($a); $c.Close(); return $true
     } catch { if ($c) { try { $c.Close() } catch {} }; return $false }
+}
+
+# Reinicia o Firefox pra liberar a sessao BiDi orfã. Necessario porque, uma vez que
+# o WS cai, o Firefox NAO libera a sessao e NAO deixa outro WS reusa-la -> session.new
+# fica travado em "Maximum active sessions". Matar+reabrir zera as sessoes (0 ativas).
+# Seguro na rodada: audio e o ULTIMO passo do WhatsApp; nada depois usa o Firefox.
+function Restart-Firefox {
+    Log "Reiniciando o Firefox para liberar a sessao BiDi..." Yellow
+    try { Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force } catch {}
+    Start-Sleep -Seconds 2
+    if (-not (Test-Path $FirefoxExe)) { throw "firefox.exe nao encontrado em $FirefoxExe (nao consigo reiniciar)." }
+    Start-Process -FilePath $FirefoxExe -ArgumentList @(
+        "-no-remote","-profile",$FirefoxProfile,
+        "--remote-debugging-port=$Port","https://web.whatsapp.com/"
+    )
+    $deadline = (Get-Date).AddSeconds(45)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Port) { break }
+        Start-Sleep -Milliseconds 800
+    }
+    if (-not (Test-Port)) { throw "BiDi nao voltou apos reiniciar o Firefox (porta $Port)." }
+    Start-Sleep -Seconds 8   # deixa o WhatsApp Web comecar a carregar (Wait-Ready cuida do resto)
 }
 
 function Receive-WS([int]$Timeout = 30) {
@@ -132,9 +161,11 @@ function Connect-Bidi {
         $script:ws.ConnectAsync([Uri]"ws://127.0.0.1:$Port/session", $cts.Token).GetAwaiter().GetResult() | Out-Null
     } finally { $cts.Dispose() }
 
-    # session.new cria a sessao BiDi. Deve rodar DEPOIS do collector (que faz Restart-Firefox),
-    # pois o Firefox precisa estar com 0 sessoes ativas. Rodar standalone (sem collector antes)
-    # falha com "Maximum active sessions" porque alguma sessao anterior ainda esta retida.
+    # Cria a sessao BiDi. O Firefox so aceita 1 sessao ativa e NAO libera a anterior
+    # quando o WS cai (comprovado: session.new segue bloqueado e getTree nao reusa a
+    # orfã de outro WS). Por isso a recuperacao real e reiniciar o Firefox -- feita
+    # pelo loop externo (Restart-Firefox) antes de reconectar. Aqui so criamos; se
+    # ainda houver orfã, propaga o erro pro loop externo reiniciar o Firefox.
     Bidi "session.new" @{ capabilities=@{ alwaysMatch=@{} } } 15 | Out-Null
     $script:sessionCreated = $true
 
@@ -383,24 +414,128 @@ function Find-Audios {
     return @($rows)
 }
 
+# --- Scroll de recovery (mesma deteccao robusta do collector/probe6) ---------
+# Diferente do collector, o audio NAO salta para scrollTop=0: sobe em PASSOS
+# (~85% da altura visivel, com sobreposicao) para cada nota de voz passar pela
+# viewport e o blob poder ser adquirido. Ver whatsapp-scroll-top-detection.
+function Measure-AudioScroll {
+    $code = @'
+(() => {
+ const clean=v=>(v||"").replace(/[‎‏‪-‮]/g,"").replace(/\s+/g," ").trim();
+ const main=document.querySelector("#main"); if(!main) return JSON.stringify({ok:false});
+ let sc=null,best=0; for(const e of main.querySelectorAll("div")){ const d=e.scrollHeight-e.clientHeight; if(d>best && e.clientHeight>200){best=d;sc=e;} }
+ const metas=[...main.querySelectorAll("[data-pre-plain-text]")];
+ const oldest = metas.length? clean(metas[0].getAttribute("data-pre-plain-text")) : "";
+ const spin = main.querySelector('[role="progressbar"], [data-icon="loading"], [aria-busy="true"]');
+ return JSON.stringify({ok:true,rendered:metas.length,oldest,
+   scrollable:!!sc, scrollTop: sc?Math.round(sc.scrollTop):0, scrollHeight: sc?sc.scrollHeight:0,
+   clientHeight: sc?sc.clientHeight:0, overflow: sc?(sc.scrollHeight-sc.clientHeight):0, spinner:!!spin });
+})()
+'@
+    return JSJson $code 10
+}
+
+# Sobe UM passo (~85% da viewport). Retorna o novo scrollTop (string) ou marcador.
+function Scroll-AudioUpStep {
+    $code = @'
+(() => { const main=document.querySelector("#main"); if(!main) return "nomain"; let sc=null,best=0; for(const e of main.querySelectorAll("div")){ const d=e.scrollHeight-e.clientHeight; if(d>best && e.clientHeight>200){best=d;sc=e;} } if(!sc) return "noscroller"; const step=Math.max(200,Math.round(sc.clientHeight*0.85)); sc.scrollTop=Math.max(0,sc.scrollTop-step); sc.dispatchEvent(new Event("scroll",{bubbles:true})); return String(Math.round(sc.scrollTop)); })()
+'@
+    return [string](JS $code 8)
+}
+
 function Setup-SilentPlay {
-    # Hookea HTMLAudioElement.prototype.play para silenciar ANTES de chamar o original.
-    # O WhatsApp ainda baixa + descriptografa o audio (necessario para o blob ser criado);
-    # apenas nao toca pelas caixas/fone. Idempotente. Fallback: se falhar, segue com som.
+    # Hookea a REPRODUCAO para silenciar ANTES de tocar. O WhatsApp ainda baixa +
+    # descriptografa o audio (necessario para o blob ser criado); apenas nao sai som.
+    # Idempotente. BLINDADO em 3 frentes para NUNCA vazar som no escritorio:
+    #   (1) HTMLMediaElement.prototype.play -> forca muted/volume=0 (cobre <audio> e <video>);
+    #   (2) enforcement: remuta todo <audio>/<video> a cada 300ms;
+    #   (3) Web Audio: intercepta AudioNode.connect e insere ganho 0 antes do destino
+    #       (unico caminho que escaparia do mute de elemento). Silencio garantido.
+    # Retorna "installed"/"already"/"" e $script:silentOK indica se o silencio esta ativo.
+    $script:silentOK = $false
     try {
-        JS @'
+        $r = JS @'
 (() => {
   if (window._waSilentInstalled) return "already";
   window._waSilentInstalled = true;
-  const orig = HTMLAudioElement.prototype.play;
-  HTMLAudioElement.prototype.play = function() {
-    try { this.muted = true; this.volume = 0; } catch(e) {}
-    return orig.call(this);
-  };
+  const mute = el => { try { el.muted = true; el.volume = 0; el.defaultMuted = true; } catch(e){} };
+  // (1) play() sempre mutado (guarda o original pra restaurar no teardown)
+  const proto = (window.HTMLMediaElement && HTMLMediaElement.prototype) || HTMLAudioElement.prototype;
+  const origPlay = proto.play;
+  window._waMediaProto = proto;
+  window._waOrigPlay = origPlay;
+  proto.play = function() { mute(this); return origPlay.apply(this, arguments); };
+  // (2) enforcement periodico
+  const sweep = () => { try { document.querySelectorAll("audio,video").forEach(mute); } catch(e){} };
+  sweep();
+  window._waSilentSweep = setInterval(sweep, 300);
+  // (3) Web Audio: qualquer node que conecte no destino (alto-falante) passa por ganho 0
+  try {
+    if (window.AudioNode && AudioNode.prototype.connect && !AudioNode.prototype.__waMuted) {
+      const origConnect = AudioNode.prototype.connect;
+      window._waOrigConnect = origConnect;
+      AudioNode.prototype.connect = function(dest) {
+        try {
+          if (dest && window.AudioDestinationNode && dest instanceof AudioDestinationNode) {
+            const g = this.context.createGain(); g.gain.value = 0;
+            origConnect.call(this, g);
+            return origConnect.call(g, dest);
+          }
+        } catch(e){}
+        return origConnect.apply(this, arguments);
+      };
+      AudioNode.prototype.__waMuted = true;
+    }
+  } catch(e){}
   return "installed";
 })()
-'@ 8 | Out-Null
-    } catch { Log "AVISO: Setup-SilentPlay falhou (audio pode tocar); seguindo." DarkYellow }
+'@ 8
+        if ($r -eq "installed" -or $r -eq "already") { $script:silentOK = $true }
+    } catch { Log "AVISO: Setup-SilentPlay falhou; NAO vou disparar play (evita vazar som)." Red; $script:silentOK = $false }
+    return $script:silentOK
+}
+
+# Confere que o silencio ainda esta ativo (o hook e o sweep). Chamado antes de
+# CADA disparo de play. Se nao estiver, tenta reinstalar; se falhar, retorna
+# $false e o chamador PULA o audio (prefere perder audio a vazar som).
+function Assert-Silent {
+    try {
+        $ok = JS 'window._waSilentInstalled && !!window._waSilentSweep ? "1" : "0"' 5
+        if ($ok -eq "1") { return $true }
+    } catch {}
+    # tenta reinstalar uma vez
+    Setup-SilentPlay | Out-Null
+    return [bool]$script:silentOK
+}
+
+# Remove o mute e restaura o WhatsApp Web ao normal (play/volume/Web Audio).
+# CRITICO: PAUSA todos os audios ANTES de desmutar -> nenhum audio que ainda
+# esteja tocando (mutado) volta a ter volume e vaza som ao restaurar.
+function Teardown-SilentPlay {
+    $code = @'
+(() => {
+  if (!window._waSilentInstalled) return "not-installed";
+  // 1) para tudo que estiver tocando, AINDA mutado
+  try { document.querySelectorAll("audio,video").forEach(el=>{ try{ el.pause(); el.currentTime=0; }catch(e){} }); } catch(e){}
+  // 2) desliga o enforcement
+  try { if (window._waSilentSweep) { clearInterval(window._waSilentSweep); window._waSilentSweep=null; } } catch(e){}
+  // 3) restaura play() original
+  try { if (window._waMediaProto && window._waOrigPlay) { window._waMediaProto.play = window._waOrigPlay; } } catch(e){}
+  // 4) restaura Web Audio connect
+  try { if (window._waOrigConnect && window.AudioNode) { AudioNode.prototype.connect = window._waOrigConnect; AudioNode.prototype.__waMuted = false; } } catch(e){}
+  // 5) agora que esta tudo pausado, desmuta os elementos (volume normal)
+  try { document.querySelectorAll("audio,video").forEach(el=>{ try{ el.muted=false; el.defaultMuted=false; el.volume=1; }catch(e){} }); } catch(e){}
+  window._waSilentInstalled = false;
+  return "restored";
+})()
+'@
+    try {
+        $r = JS $code 8
+        if ($r -eq "restored") { Log "Mute removido: WhatsApp Web restaurado ao normal." Green; return $true }
+        if ($r -eq "not-installed") { return $true }
+    } catch {}
+    Log "AVISO: nao consegui remover o mute agora (WS fora). Atualizar/reabrir o WhatsApp Web (F5) restaura o som." DarkYellow
+    return $false
 }
 
 # Instala interceptor de URL.createObjectURL para capturar blob de audio.
@@ -481,147 +616,361 @@ function Get-AudioBase64([int]$Index) {
     return JSAsync $code 90
 }
 
+# FALLBACK 2: dispara o play VIA JS (mutado), sem depender do clique confiavel
+# na coordenada. Autoplay mutado e permitido pelo browser, entao chamar .play()
+# direto num <audio> forca o download/descriptografia do blob mesmo sem gesto do
+# usuario e mesmo se o Click-Point tiver errado a coordenada. Estrategias, todas
+# mutadas: (a) .click() nativo no botao de play mais proximo de (x,y);
+# (b) dispatch de PointerEvents no botao; (c) muted+play() em <audio> proximos.
+# Nao garante gesto "trusted" (React pode ignorar (a)/(b)), mas (c) funciona
+# quando ha <audio>, e o conjunto cobre mais casos que o clique sozinho.
+function Trigger-PlayJS([int]$X, [int]$Y) {
+    $code = @"
+(() => {
+ const tx=$X, ty=$Y;
+ const mute=el=>{try{el.muted=true;el.volume=0;el.defaultMuted=true;}catch(e){}};
+ const near=el=>{const r=el.getBoundingClientRect(); if(r.width===0&&r.height===0) return 1e9;
+   const cx=r.left+r.width/2, cy=r.top+r.height/2; return Math.hypot(cx-tx,cy-ty);};
+ const main=document.querySelector("#main")||document;
+ // 1) botao de play mais proximo do alvo
+ const btnSel='span[data-icon="audio-play"],span[data-icon="ptt-play"],button[aria-label*="Reproduzir" i],button[aria-label*="Play" i],[data-testid="ptt-play-stop-btn"],[data-testid="audio-play-stop-btn"]';
+ let best=null, bestD=1e9;
+ [...main.querySelectorAll(btnSel)].forEach(el=>{const b=el.closest("button")||el.closest('[role="button"]')||el; const d=near(b); if(d<bestD){bestD=d;best=b;}});
+ let acted=0;
+ if(best && bestD<400){
+   try{ best.click(); acted++; }catch(e){}
+   try{
+     const r=best.getBoundingClientRect(), cx=r.left+r.width/2, cy=r.top+r.height/2;
+     for(const t of ["pointerdown","pointerup","click"]){
+       best.dispatchEvent(new PointerEvent(t,{bubbles:true,cancelable:true,clientX:cx,clientY:cy}));
+     }
+     acted++;
+   }catch(e){}
+ }
+ // 2) forca muted+play em qualquer <audio> (cria blob mesmo sem gesto)
+ [...document.querySelectorAll("audio")].forEach(au=>{ mute(au); try{ au.load&&au.load(); }catch(e){} try{ const p=au.play(); if(p&&p.catch)p.catch(()=>{}); acted++; }catch(e){} });
+ return String(acted);
+})()
+"@
+    try { JS $code 8 | Out-Null } catch {}
+}
+
+# FALLBACK 3: rola a mensagem de audio pra dentro da viewport do #main, pra o
+# clique/coordenada voltar a funcionar em notas que estavam fora da tela.
+function ScrollIntoView-Audio([int]$X, [int]$Y) {
+    $code = @"
+(() => {
+ const tx=$X, ty=$Y;
+ const main=document.querySelector("#main"); if(!main) return "false";
+ const near=el=>{const r=el.getBoundingClientRect(); if(r.width===0&&r.height===0) return 1e9;
+   const cx=r.left+r.width/2, cy=r.top+r.height/2; return Math.hypot(cx-tx,cy-ty);};
+ const sel='span[data-icon="audio-play"],span[data-icon="ptt-play"],[data-testid="ptt-play-stop-btn"],[data-testid="audio-play-stop-btn"]';
+ let best=null,bestD=1e9;
+ [...main.querySelectorAll(sel)].forEach(el=>{const d=near(el); if(d<bestD){bestD=d;best=el;}});
+ if(best){ best.scrollIntoView({block:"center"}); return "true"; }
+ return "false";
+})()
+"@
+    try { JS $code 6 | Out-Null } catch {}
+}
+
+# Tenta obter os bytes (base64) de UM audio em CAMADAS de fallback. TODO disparo
+# de play e precedido por Assert-Silent: se o silencio nao estiver ativo, NAO
+# dispara e retorna "" (prefere perder o audio a vazar som no escritorio).
+#   Camada 0: ja tem src -> so busca o blob.
+#   Camada 1: clique CONFIAVEL (Click-Point) no botao -> WA baixa/descriptografa.
+#   Camada 2: play VIA JS mutado (Trigger-PlayJS) -> nao depende da coordenada.
+#   Camada 3: scroll-into-view + clique confiavel de novo (pega fora da viewport).
+function Acquire-Blob($au) {
+    # camada 0
+    if ($au.hasSrc) {
+        $b = Get-AudioBase64 ([int]$au.i)
+        if (-not [string]::IsNullOrWhiteSpace($b)) { return $b }
+    }
+    # camadas que DISPARAM play: exigem silencio confirmado
+    $layers = @(
+        @{ name="clique confiavel"; act={ try { Click-Point ([int]$au.x) ([int]$au.y) } catch {} }; wait=2000 },
+        @{ name="play via JS mutado"; act={ Trigger-PlayJS ([int]$au.x) ([int]$au.y) }; wait=1800 },
+        @{ name="scroll+clique"; act={ ScrollIntoView-Audio ([int]$au.x) ([int]$au.y); Start-Sleep -Milliseconds 400; try { Click-Point ([int]$au.x) ([int]$au.y) } catch {} }; wait=2000 }
+    )
+    foreach ($layer in $layers) {
+        if (-not (Assert-Silent)) {
+            Log "  audio #$($au.i): silencio NAO confirmado -> pulando (nao vou arriscar vazar som)." Red
+            return ""
+        }
+        try { Clear-BlobCapture } catch {}
+        & $layer.act
+        Start-Sleep -Milliseconds $layer.wait
+        $b = Get-AudioBase64 ([int]$au.i)
+        if (-not [string]::IsNullOrWhiteSpace($b)) { return $b }
+    }
+    return ""
+}
+
 # ---- RUN ---------------------------------------------------------------------
 $cutoff = (Get-Date).AddDays(-$Days)
 $done   = Load-ProcessedAudios
-$saved  = 0; $skipped = 0; $noblob = 0
+$saved  = 0; $skipped = 0; $noblob = 0; $outWin = 0
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "WHATSAPP AUDIO EXTRACTOR (best-effort)" -ForegroundColor Cyan
+Write-Host "WHATSAPP AUDIO EXTRACTOR (best-effort, silencioso)" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 
-try {
-    Connect-Bidi
-    Wait-Ready
-    Setup-SilentPlay
-    Setup-BlobCapture
-    Reset-SidebarTop
+$seen         = @{}    # persiste entre reconexoes -> retoma de onde parou
+$chatClasses  = @{}    # persiste entre reconexoes -> classe (5 estados) por chat visitado
+$sidebarEndedByList = $false   # true so quando a sidebar terminou por fim-de-lista real (nao MaxChats/erro)
+$maxReconnect = 8    # o WS do Firefox cai a cada ~90s; cada queda custa 1 reinicio+retomada. Margem p/ varrer a lista toda.
+$reconnects   = 0
+$completed    = $false
 
-    $seen = @{}
-    $sidebarDone = $false
-    $stagnant = 0
+while (-not $completed -and $reconnects -le $maxReconnect) {
+    try {
+        Connect-Bidi
+        Wait-Ready
+        # GATE DE SEGURANCA: sem silencio confirmado, aborta esta rodada de audio
+        # inteira (nunca dispara play). Melhor perder audios do que vazar som.
+        if (-not (Setup-SilentPlay)) { throw "SILENCIO nao instalou; abortando extracao de audio (evita vazar som)." }
+        Setup-BlobCapture
+        Reset-SidebarTop
+        if ($reconnects -gt 0) { Log "Retomando varredura ($($seen.Count) chats ja vistos serao pulados)." Cyan }
 
-    while (-not $sidebarDone -and $seen.Count -lt $MaxChats) {
-        $visible = @(Get-VisibleChats)
-        $newVisible = 0
+        $noMove = 0
 
-        foreach ($item in $visible) {
-            $name = ([string]$item.name).Trim()
-            if (-not $name) { continue }
-            $key = $name.ToLowerInvariant()
-            if ($seen.ContainsKey($key)) { continue }
-            $seen[$key] = $true; $newVisible++
+        while ($seen.Count -lt $MaxChats) {
+            $visible = @(Get-VisibleChats)
 
-            try {
-                if (-not (Click-Chat $name)) { continue }
-                Start-Sleep -Milliseconds 900
+            foreach ($item in $visible) {
+                $name = ([string]$item.name).Trim()
+                if (-not $name) { continue }
+                $key = $name.ToLowerInvariant()
+                if ($seen.ContainsKey($key)) { continue }
+                $seen[$key] = $true
 
-                $audios = @(Find-Audios)
-                if (-not $audios -or $audios.Count -eq 0) { continue }
+                try {
+                    if (-not (Click-Chat $name)) { $chatClasses[$key] = "OPEN_FAIL"; continue }
+                    Start-Sleep -Milliseconds 900
 
-                Log "[$($seen.Count)] $name : $($audios.Count) audio(s)" Cyan
-                $count = 0
+                    # RECOVERY POR SCROLL (mesma mecanica do coletor/probe6): sobe o #main
+                    # em PASSOS, processando os audios de cada viewport, ate CUTOFF real,
+                    # TOPO real ou teto. Cada nota de voz PRECISA passar pela viewport para
+                    # o blob ser adquirido -> por isso passos incrementais (nao salto p/ 0).
+                    # A aquisicao (Acquire-Blob 0-3), o gate de silencio e o dedup por hash
+                    # sao os mesmos de antes; o scroll e adicionado POR CIMA.
+                    $chatClass  = "INDETERMINATE"
+                    $chatSaved  = 0          # SO saves NOVOS neste chat/rodada -> teto = recovery progressivo
+                    $maxSteps   = 45
+                    $topStable  = 0
+                    $prevHeight = -1
+                    $prevOldest = "__init__"
+                    Log "[$($seen.Count)] $name : varrendo audios (scroll-up ate cutoff/topo)" Cyan
 
-                foreach ($au in $audios) {
-                    if ($count -ge $MaxAudiosPerChat) { break }
-                    $count++
+                    for ($step = 0; $step -lt $maxSteps; $step++) {
+                        # 1) processa os audios renderizados nesta viewport
+                        $audios = @(Find-Audios)
+                        foreach ($au in $audios) {
+                            # filtro por data (quando o meta traz a data)
+                            $dt = Parse-MetaDate ([string]$au.meta)
+                            if ($dt -and $dt -lt $cutoff) { $outWin++; continue }
 
-                    # filtro por data (quando o meta traz a data)
-                    $dt = Parse-MetaDate ([string]$au.meta)
-                    if ($dt -and $dt -lt $cutoff) { continue }
+                            $author = Parse-MetaAuthor ([string]$au.meta)
+                            # heuristica de direcao: sem marcador confiavel, assume "in" (recebido)
+                            $direction = "in"
+                            $preId = SHA256-Text "$name|$([string]$au.meta)|$direction|idx:$($au.i)"
 
-                    $author = Parse-MetaAuthor ([string]$au.meta)
-                    # heuristica de direcao: sem marcador confiavel, assume "in" (recebido)
-                    $direction = "in"
-                    $preId = SHA256-Text "$name|$([string]$au.meta)|$direction|idx:$($au.i)"
+                            # se ja processado (por meta) pula cedo
+                            if ($done.ContainsKey($preId)) { $skipped++; continue }
 
-                    # se ja processado (por meta) pula cedo
-                    if ($done.ContainsKey($preId)) { $skipped++; continue }
+                            $b64 = Acquire-Blob $au
+                            if ([string]::IsNullOrWhiteSpace($b64)) {
+                                $noblob++
+                                Log "  audio #$($au.i): blob nao disponivel apos todos os fallbacks (pulado)" DarkYellow
+                                continue
+                            }
 
-                    # garante blob: se nao tem src, da play (clique confiavel) e espera
-                    if (-not $au.hasSrc) {
-                        try { Clear-BlobCapture } catch {}
-                        try { Click-Point ([int]$au.x) ([int]$au.y) } catch {}
-                        Start-Sleep -Milliseconds 2000
+                            $bytes = [Convert]::FromBase64String($b64)
+                            $shaBytes = [Security.Cryptography.SHA256]::Create()
+                            $hash = ([BitConverter]::ToString($shaBytes.ComputeHash($bytes))).Replace("-","").ToLowerInvariant()
+                            $shaBytes.Dispose()
+
+                            # dedup autoritativo por conteudo (cobre reencontro entre viewports
+                            # sobrepostos e entre rodadas via .ogg do inbox) -> zero perda/zero dup
+                            if ($done.ContainsKey($hash)) { $skipped++; continue }
+
+                            $ogg  = Join-Path $InboxDir "$hash.ogg"
+                            [IO.File]::WriteAllBytes($ogg, $bytes)
+
+                            $side = [pscustomobject]@{
+                                chat      = $name
+                                meta      = [string]$au.meta
+                                author    = $author
+                                direction = $direction
+                                timestamp = $(if ($dt) { $dt.ToString("o") } else { $null })
+                                source    = "whatsapp-audio"
+                                extractedAt = (Get-Date).ToString("o")
+                            }
+                            [IO.File]::WriteAllText((Join-Path $InboxDir "$hash.json"), ($side | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
+
+                            $done[$hash] = $true
+                            $done[$preId] = $true
+                            $saved++
+                            $chatSaved++
+                            Log "  salvo audio #$($au.i) ($([math]::Round($bytes.Length/1024,1)) KB)" Green
+                        }
+
+                        # 2) mede o estado do scroll (deteccao robusta do probe6)
+                        $m = Measure-AudioScroll
+                        if (-not $m -or -not $m.ok) { $chatClass = "CDP_ERROR"; break }
+
+                        # 3) CUTOFF real: a mensagem mais antiga renderizada ja passou da janela
+                        $oldDt = Parse-MetaDate ([string]$m.oldest)
+                        if ($oldDt -and $oldDt -lt $cutoff) { $chatClass = "CUTOFF_REACHED"; break }
+
+                        # 4) CORRECAO 4: teto de saves NOVOS por chat = INCOMPLETO (pode haver
+                        #    mais audios na janela nao extraidos). Equivalente a SCROLL_LIMIT ->
+                        #    checkpoint de audio NAO avanca -> proxima rodada refaz (dedup pula
+                        #    os ja salvos e continua dos proximos = recovery progressivo).
+                        if ($chatSaved -ge $MaxAudiosPerChat) { $chatClass = "SCROLL_LIMIT_REACHED"; break }
+
+                        # 5) TOPO real confirmado (probe6): scrollTop fixo <=5 + scrollHeight
+                        #    congelado + oldest congelado, 3x seguidas, ciente de spinner
+                        $atTopNow     = ([int]$m.scrollTop -le 5)
+                        $heightFrozen = ($prevHeight -ge 0 -and [int]$m.scrollHeight -le $prevHeight)
+                        $oldestFrozen = ($prevOldest -eq [string]$m.oldest)
+                        if ($atTopNow -and $heightFrozen -and $oldestFrozen -and -not $m.spinner) {
+                            $topStable++
+                            if ($topStable -ge 3) { $chatClass = "HISTORY_TOP_REACHED"; break }
+                        } else {
+                            $topStable = 0
+                        }
+                        $prevHeight = [int]$m.scrollHeight
+                        $prevOldest = [string]$m.oldest
+
+                        # 6) sobe um passo (~85% da viewport, com sobreposicao)
+                        $r = [string](Scroll-AudioUpStep)
+                        if ($r -eq "noscroller" -or $r -eq "nomain") {
+                            # chat curto: tudo cabe na viewport -> ja processamos tudo
+                            $chatClass = "HISTORY_TOP_REACHED"; break
+                        }
+                        Start-Sleep -Milliseconds 700   # deixa lazy-load + render antes da proxima medicao
                     }
-
-                    $b64 = Get-AudioBase64 ([int]$au.i)
-                    if ([string]::IsNullOrWhiteSpace($b64)) {
-                        # tenta mais uma vez apos novo play
-                        try { Clear-BlobCapture } catch {}
-                        try { Click-Point ([int]$au.x) ([int]$au.y) } catch {}
-                        Start-Sleep -Milliseconds 1500
-                        $b64 = Get-AudioBase64 ([int]$au.i)
+                    if ($chatClass -eq "INDETERMINATE") { $chatClass = "SCROLL_LIMIT_REACHED" }  # estourou maxSteps
+                    $chatClasses[$key] = $chatClass
+                    Log "  $name -> $chatClass ($chatSaved audio(s) novos)" DarkGray
+                }
+                catch {
+                    # Se o WS morreu, PROPAGA para o loop externo reconectar e retomar
+                    # (o $seen preserva o progresso). Outros erros: loga e segue.
+                    if (-not $script:ws -or $script:ws.State -notin @(
+                            [System.Net.WebSockets.WebSocketState]::Open,
+                            [System.Net.WebSockets.WebSocketState]::CloseReceived)) {
+                        throw "WS_DOWN"
                     }
-                    if ([string]::IsNullOrWhiteSpace($b64)) {
-                        $noblob++
-                        Log "  audio #$($au.i): blob nao disponivel (pulado)" DarkYellow
-                        continue
-                    }
-
-                    $bytes = [Convert]::FromBase64String($b64)
-                    $shaBytes = [Security.Cryptography.SHA256]::Create()
-                    $hash = ([BitConverter]::ToString($shaBytes.ComputeHash($bytes))).Replace("-","").ToLowerInvariant()
-                    $shaBytes.Dispose()
-
-                    if ($done.ContainsKey($hash)) { $skipped++; continue }
-
-                    $ogg  = Join-Path $InboxDir "$hash.ogg"
-                    [IO.File]::WriteAllBytes($ogg, $bytes)
-
-                    $side = [pscustomobject]@{
-                        chat      = $name
-                        meta      = [string]$au.meta
-                        author    = $author
-                        direction = $direction
-                        timestamp = $(if ($dt) { $dt.ToString("o") } else { $null })
-                        source    = "whatsapp-audio"
-                        extractedAt = (Get-Date).ToString("o")
-                    }
-                    [IO.File]::WriteAllText((Join-Path $InboxDir "$hash.json"), ($side | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
-
-                    $done[$hash] = $true
-                    $done[$preId] = $true
-                    $saved++
-                    Log "  salvo audio #$($au.i) ($([math]::Round($bytes.Length/1024,1)) KB)" Green
+                    Log "Falha em ${name}: $($_.Exception.Message)" DarkYellow
+                    continue
                 }
             }
-            catch {
-                Log "Falha em ${name}: $($_.Exception.Message)" DarkYellow
-                # Se o WS morreu (Aborted/Closed), interrompe o loop graciosamente
-                # em vez de propagar erro para fora com sessao vazada.
-                if (-not $script:ws -or $script:ws.State -notin @(
-                        [System.Net.WebSockets.WebSocketState]::Open,
-                        [System.Net.WebSockets.WebSocketState]::CloseReceived)) {
-                    Log "WebSocket encerrado pelo servidor. Encerrando varredura." Yellow
-                    $sidebarDone = $true
-                    break
-                }
-                continue
+
+            # Fim da lista = quando a barra nao rola mais (2x seguidas), nao por
+            # estagnacao de novos (apos reconexao o topo esta todo em $seen).
+            $move = Scroll-Sidebar
+            if (-not $move -or -not $move.moved) { $noMove++ } else { $noMove = 0; Start-Sleep -Milliseconds 220 }
+            if ($noMove -ge 2) { $sidebarEndedByList = $true; break }
+
+            # Keep-alive: session.status a cada ~55s evita o Firefox fechar o WS por inatividade.
+            if ((-not $script:_lastKA) -or ((Get-Date) - $script:_lastKA).TotalSeconds -gt 55) {
+                try { Bidi "session.status" @{} 5 | Out-Null } catch {}
+                $script:_lastKA = Get-Date
             }
         }
 
-        if ($newVisible -eq 0) { $stagnant++ } else { $stagnant = 0 }
-        $move = Scroll-Sidebar
-        if (-not $move -or -not $move.moved -or $stagnant -ge 2) { $sidebarDone = $true }
-        else { Start-Sleep -Milliseconds 220 }
-
-        # Keep-alive: envia session.status a cada ~60s para evitar que o Firefox
-        # encerre o WebSocket por inatividade (timeout ~1min40s observado).
-        if ((-not $script:_lastKA) -or ((Get-Date) - $script:_lastKA).TotalSeconds -gt 55) {
-            try { Bidi "session.status" @{} 5 | Out-Null } catch {}
-            $script:_lastKA = Get-Date
+        $completed = $true
+    }
+    catch {
+        $msg = $_.Exception.Message
+        Close-Bidi
+        # QUALQUER falha (WS caiu, sessao orfã bloqueando session.new, WhatsApp nao
+        # pronto) recupera do mesmo jeito: reinicia o Firefox (unica forma de liberar
+        # a sessao BiDi) e RETOMA de onde parou ($seen persiste). Firefox limpo => a
+        # proxima Connect-Bidi cria a sessao sem "Maximum active sessions".
+        if ($reconnects -lt $maxReconnect) {
+            $reconnects++
+            Log "Falha ($msg). Reiniciando Firefox e retomando ($reconnects/$maxReconnect)..." Yellow
+            try { Restart-Firefox } catch { Log "Restart-Firefox falhou: $($_.Exception.Message)" Red }
+            continue
         }
+        Log "ERRO: $msg" Red
+        break
     }
 }
-catch {
-    Log "ERRO: $($_.Exception.Message)" Red
-}
-finally {
-    Close-Bidi
-}
+
+# SEMPRE remove o mute ao terminar (restaura o WhatsApp Web). Se o WS caiu,
+# tenta reconectar UMA vez so pra fazer o teardown -- nunca deixa o WhatsApp mudo.
+try {
+    if (-not $script:ws -or $script:ws.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+        try { Connect-Bidi } catch {}
+    }
+    if ($script:ws -and $script:ws.State -eq [System.Net.WebSockets.WebSocketState]::Open -and $script:context) {
+        Teardown-SilentPlay | Out-Null
+    } else {
+        Log "AVISO: WS fora no fim; nao deu pra remover o mute via script. Um F5 no WhatsApp Web restaura o som." DarkYellow
+    }
+} catch {}
+
+Close-Bidi
 
 Write-Host ""
-Write-Host ("Audios salvos: $saved | Pulados: $skipped | Sem blob: $noblob") -ForegroundColor Green
+Write-Host ("Audios salvos: $saved | Pulados: $skipped | Fora da janela (-Days $Days): $outWin | Sem blob: $noblob | Reconexoes: $reconnects") -ForegroundColor Green
 Write-Host ("Inbox: $InboxDir") -ForegroundColor DarkGray
+
+# ---- CHECKPOINT DE RECOVERY (CORRECAO 3: arquivo SEPARADO) -------------------
+# NUNCA escreve no whatsapp-audio-state.json (do transcritor). Este arquivo so
+# registra o STATUS honesto da varredura de audio. So marca "avancado" quando a
+# varredura foi completa E toda limpa (todo chat em CUTOFF/TOP) E sem cap batido.
+# Caso contrario preserva o lastSuccessfulRun anterior -> proxima rodada refaz a
+# janela (dedup pula os ja salvos). Espelha o gate do coletor (§11/§14).
+try {
+    $audioAllClean = $true
+    foreach ($k in $chatClasses.Keys) {
+        if ($chatClasses[$k] -notin @("CUTOFF_REACHED","HISTORY_TOP_REACHED")) { $audioAllClean = $false; break }
+    }
+    $audioTraversalComplete = ($sidebarEndedByList -and $completed)
+    $canAdvanceAudio = ($audioTraversalComplete -and $audioAllClean -and $seen.Count -gt 0)
+
+    # preserva lastSuccessfulRun anterior quando NAO pode avancar
+    $prevLast = $null
+    if (Test-Path $AudioRecoveryState) {
+        try { $prevLast = (Get-Content $AudioRecoveryState -Raw | ConvertFrom-Json).lastSuccessfulRun } catch {}
+    }
+    $lastRun = if ($canAdvanceAudio) { (Get-Date).ToString("o") } else { $prevLast }
+
+    $classesObj = [ordered]@{}
+    foreach ($k in ($chatClasses.Keys | Sort-Object)) { $classesObj[$k] = $chatClasses[$k] }
+
+    $recovery = [ordered]@{
+        version           = 1
+        updatedAt         = (Get-Date).ToString("o")
+        lastSuccessfulRun = $lastRun
+        traversalComplete = $audioTraversalComplete
+        allClean          = $audioAllClean
+        markAdvanced      = $canAdvanceAudio
+        cutoffDays        = $Days
+        chatsSeen         = $seen.Count
+        reconnects        = $reconnects
+        saved             = $saved
+        skipped           = $skipped
+        noblob            = $noblob
+        outWin            = $outWin
+        chatClasses       = $classesObj
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($AudioRecoveryState, (($recovery | ConvertTo-Json -Depth 6)), $utf8NoBom)
+
+    if ($canAdvanceAudio) {
+        Write-Host ("Recovery de audio COMPLETO (varredura limpa) -> checkpoint avancado.") -ForegroundColor Green
+    } else {
+        Write-Host ("Recovery de audio INCOMPLETO (traversal=$audioTraversalComplete clean=$audioAllClean) -> checkpoint NAO avancou; proxima rodada refaz a janela.") -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host ("AVISO: falha ao gravar $AudioRecoveryState : $($_.Exception.Message)") -ForegroundColor DarkYellow
+}

@@ -242,6 +242,27 @@ function Normalize-Text([string]$s) {
     return $s.Trim()
 }
 
+function Get-Tokens([string]$s) {
+    # Tokens de conteudo do assunto (sem acentos, sem stopwords, >=3 chars) p/ o
+    # dedup por similaridade. Deterministico e barato (cacheado por card).
+    $n = Normalize-Text $s
+    if ([string]::IsNullOrWhiteSpace($n)) { return @() }
+    $stop = @('de','da','do','das','dos','no','na','nos','nas','em','com','sem',
+              'para','pra','pro','por','que','uma','uns','umas','ao','aos','the',
+              'of','to','and','sobre','como')
+    return @($n -split ' ' | Where-Object { $_.Length -ge 3 -and $_ -notin $stop } | Select-Object -Unique)
+}
+
+function Test-SamePerson([string]$p1, [string]$p2) {
+    # Pessoa "compativel": igual, uma contida na outra (ex.: "alessandra" vs
+    # "alessandra aguiar"), ou uma vazia. Gate barato antes do calculo de assunto.
+    $a = Normalize-Text $p1; $b = Normalize-Text $p2
+    if ($a -eq $b) { return $true }
+    if ([string]::IsNullOrWhiteSpace($a) -or [string]::IsNullOrWhiteSpace($b)) { return $true }
+    if ($a -like "*$b*" -or $b -like "*$a*") { return $true }
+    return $false
+}
+
 function Get-SBID([string]$pessoa, [string]$assunto, [string]$categoria) {
     # Identidade ESTAVEL: so pessoa + assunto. O status/categoria NAO entra na
     # identidade, senao a mesma tarefa vira card novo toda vez que muda de
@@ -255,6 +276,31 @@ function Get-SBID([string]$pessoa, [string]$assunto, [string]$categoria) {
         return "sb-" + $hex.Substring(0, 12)
     }
     finally { $sha.Dispose() }
+}
+
+function Test-NoiseItem($raw) {
+    # O proprio prompt ja manda OMITIR item sem acao ("nenhuma acao pendente" etc.),
+    # mas a LLM (local/Joule) as vezes emite mesmo assim -> vira card-ruido no board
+    # (ex.: "Cupom de desconto -> nenhuma acao pendente"). Aqui barramos de forma
+    # DETERMINISTICA: so dropa quando NAO ha acao real (proxima_acao vazia/ruido) ou
+    # quando o texto diz explicitamente que nao e pendencia. Cada drop e logado.
+    $acao = if ($raw.proxima_acao -and "$($raw.proxima_acao)" -ne "null") { [string]$raw.proxima_acao } else { "" }
+    $n = Normalize-Text $acao
+    if ([string]::IsNullOrWhiteSpace($n)) { return $true }   # sem proxima acao -> ruido
+    if ($n -eq "n a") { return $true }                       # "n/a"
+    $noise = @(
+        'nenhuma acao', 'nenhuma pendencia', 'nenhuma providencia',
+        'sem acao', 'sem pendencia', 'nao ha acao', 'nao ha pendencia',
+        'nao e pendencia', 'nao foi pendencia', 'nada a fazer', 'nada pendente',
+        'nenhuma acao necessaria', 'nenhuma acao pendente'
+    )
+    foreach ($p in $noise) { if ($n -like "*$p*") { return $true } }
+    # o proprio assunto/resumo declarando que nao e pendencia
+    $blob = Normalize-Text ("$($raw.assunto) $($raw.resumo)")
+    foreach ($p in @('nao foi pendencia', 'nao e pendencia', 'nao ha pendencia', 'sem acao pendente')) {
+        if ($blob -like "*$p*") { return $true }
+    }
+    return $false
 }
 
 function Get-Category([string]$status, [string]$canal, [string]$tipo) {
@@ -467,13 +513,10 @@ else {
     $copilotWindow = Format-Window $copilotHours "(Teams, transcricoes e e-mails)"
     $meetingAhead  = 1
 
-    # WhatsApp: guarda de 20h para evitar duplicatas por reformulacao do LLM.
-    # Na pratica roda 1x/dia (manha); as rodadas do meio-dia e noite pulam.
-    # -SkipWhatsApp explicito na linha de comando nao e afetado (ja e $true).
-    if (-not $SkipWhatsApp -and $waGap -lt 20) {
-        Log "WhatsApp: pulado automaticamente (gap ${waGap}h < 20h; roda 1x/dia)." DarkGray
-        $SkipWhatsApp = $true
-    }
+    # WhatsApp: NAO ha mais guarda de 20h. Com o cursor por offset de linha
+    # (whatsapp-analysis-state.json), cada rodada 07/13/19 analisa SO as linhas
+    # ainda nao analisadas -> rodar 3x/dia nao gera duplicatas por reformulacao.
+    # -SkipWhatsApp explicito na linha de comando continua respeitado.
 
     $waSinceLabel = if ($waSinceIso) { " | marca dagua desde $waSinceIso" } else { "" }
     Log ("Janela (delta por canal): Joule=${jouleHours}h Copilot=${copilotHours}h WhatsApp=${waDays}d${waSinceLabel}") DarkGray
@@ -482,13 +525,39 @@ else {
 $channelStatus = [ordered]@{}
 $allItems = New-Object System.Collections.ArrayList
 
+# --- Contexto de dedup: pendencias JA abertas -------------------------------
+# Injetado nos prompts dos canais (placeholder {{ABERTAS}}) para o LLM REUSAR o
+# MESMO assunto/pessoa quando a mesma tarefa recorre -> evita quase-duplicata com
+# redacao diferente (que viraria sbid novo). Best-effort; sem store -> texto neutro.
+$openContext = "(nenhuma pendencia aberta ainda)"
+$openContextFile = ""
+try {
+    if (Test-Path $TasksFile) {
+        $rawStore = [System.IO.File]::ReadAllText($TasksFile, [Text.Encoding]::UTF8)
+        if (-not [string]::IsNullOrWhiteSpace($rawStore)) {
+            $openTasks = @($rawStore | ConvertFrom-Json) | Where-Object { -not $_.done }
+            if ($openTasks -and @($openTasks).Count -gt 0) {
+                $ctxLines = foreach ($t in (@($openTasks) | Select-Object -First 80)) {
+                    $p = if ($t.pessoa -and "$($t.pessoa)" -ne "null") { [string]$t.pessoa } else { "-" }
+                    "- [$p] " + [string]$t.assunto
+                }
+                $openContext = ($ctxLines -join "`n")
+            }
+        }
+    }
+} catch { $openContext = "(nenhuma pendencia aberta ainda)" }
+try {
+    $openContextFile = Join-Path $RawDir "open-context-$ts.txt"
+    [System.IO.File]::WriteAllText($openContextFile, $openContext, $Utf8NoBom)
+} catch { $openContextFile = "" }
+
 # ============================================================
 # CANAL: JOULE
 # ============================================================
 if (-not $SkipJoule) {
     try {
         $tpl = Get-Content (Join-Path $PromptsDir "joule.md") -Raw -Encoding UTF8
-        $prompt = $tpl -replace '\{\{JANELA\}\}', $jouleWindow
+        $prompt = ($tpl -replace '\{\{JANELA\}\}', $jouleWindow) -replace '\{\{ABERTAS\}\}', $openContext
         Log "Joule: consultando e-mail/calendario ($jouleWindow)..." Cyan
 
         $cap = Invoke-JsonWithRetry { & $JoulePs -Prompt $prompt -TimeoutSec 600 }
@@ -516,7 +585,7 @@ else { $channelStatus["Joule"] = "pulado" }
 if (-not $SkipCopilot) {
     try {
         $tpl = Get-Content (Join-Path $PromptsDir "copilot.md") -Raw -Encoding UTF8
-        $prompt = $tpl -replace '\{\{JANELA\}\}', $copilotWindow
+        $prompt = ($tpl -replace '\{\{JANELA\}\}', $copilotWindow) -replace '\{\{ABERTAS\}\}', $openContext
         Log "Copilot: consultando Teams/transcricoes/e-mail ($copilotWindow)..." Cyan
 
         # 360s: a busca do M365 Copilot sobre 24h de Teams+transcricoes+e-mail e
@@ -602,10 +671,13 @@ if (-not $SkipWhatsApp) {
         }
 
         $waEngineLabel = if ($WhatsAppEngine -eq 'joule') { "via Joule" } else { "com LLM local" }
-        $waSinceLogLabel = if ($waSinceIso) { " (desde $waSinceIso)" } else { "" }
-        Log "WhatsApp: analisando ultimos $waDays dias $waEngineLabel$waSinceLogLabel..." Cyan
-        $waArgs = @{ Days = $waDays; Json = $true; Engine = $WhatsAppEngine }
-        if ($waSinceIso) { $waArgs["SinceIso"] = $waSinceIso }
+        Log "WhatsApp: analisando por cursor de offset (linhas ainda nao analisadas) $waEngineLabel..." Cyan
+        # Cursor por OFFSET (whatsapp-analysis-state.json): analisa SO as linhas
+        # novas do .jsonl. -Days e apenas teto de seguranca amplo; NAO passamos
+        # -SinceIso (o offset e o cursor real). O analyzer grava pendingUpperBound;
+        # a promocao de analysisOffset acontece adiante, so apos consolidar.
+        $waArgs = @{ Days = $waDays; Json = $true; Engine = $WhatsAppEngine; UseOffset = $true }
+        if ($openContextFile) { $waArgs.OpenContextFile = $openContextFile }
         $cap = Invoke-JsonWithRetry { & $AnalyzePs @waArgs }
         $rawFile = Join-Path $RawDir "whatsapp-$ts.json"
         [System.IO.File]::WriteAllText($rawFile, $cap.Text, [Text.Encoding]::UTF8)
@@ -656,9 +728,18 @@ Log "Total de itens crus coletados: $($allItems.Count)." Gray
 # CONSOLIDACAO DETERMINISTICA
 # ============================================================
 $consolidated = @{}   # sbid -> objeto consolidado
+$noiseDropped = 0     # itens sem acao real barrados (logados, nunca silenciosos)
 
 foreach ($raw in $allItems) {
     if ($null -eq $raw) { continue }
+
+    if (Test-NoiseItem $raw) {
+        $noiseDropped++
+        $dropAssunto = if ($raw.assunto -and "$($raw.assunto)" -ne "null") { [string]$raw.assunto } else { "(sem assunto)" }
+        $dropCanal   = if ($raw.canal) { [string]$raw.canal } else { "?" }
+        Log ("  ruido ignorado [$dropCanal] (sem acao): " + $dropAssunto) DarkGray
+        continue
+    }
 
     $status = ([string]$raw.status).ToLower().Trim()
     if ([string]::IsNullOrWhiteSpace($status)) { $status = "fazer" }
@@ -719,6 +800,7 @@ foreach ($raw in $allItems) {
 }
 
 $consList = @($consolidated.Values)
+if ($noiseDropped -gt 0) { Log "Itens de ruido (sem acao) ignorados: $noiseDropped." Gray }
 Log "Consolidados (unicos por SB-ID): $($consList.Count)." Gray
 
 # Snapshot de AUDITORIA: o consolidado COMPLETO desta rodada (util p/ debug da
@@ -835,6 +917,77 @@ if (@($store).Count -gt 0) {
         }
     }
     $store = @($byNew.Values)
+}
+
+# --- Dedup por similaridade (deriva de redacao) -----------------------------
+# O sbid e hash(pessoa+assunto); quando a LLM reescreve o assunto/pessoa entre
+# rodadas, o hash muda e a MESMA tarefa vira card novo (duplicata + "novo" falso).
+# Aqui fundimos quase-duplicatas de forma CONSERVADORA e AUDITAVEL:
+#   - pessoa compativel (igual / uma contida na outra / uma vazia), E
+#   - assunto com overlap-coefficient >= limiar E >= 2 tokens de conteudo em comum.
+# Toda fusao vai pro log (Yellow) e pro history do card vencedor -> reversivel.
+$fuzzyThreshold = 0.6
+if (@($store).Count -gt 1) {
+    $items = @($store)
+    $tok = @{}
+    foreach ($t in $items) { $tok[$t.sbid] = Get-Tokens $t.assunto }
+    $removed = @{}
+    $mergedCount = 0
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $a = $items[$i]
+        if ($removed.ContainsKey($a.sbid)) { continue }
+        for ($j = $i + 1; $j -lt $items.Count; $j++) {
+            $b = $items[$j]
+            if ($removed.ContainsKey($b.sbid)) { continue }
+            if ($a.sbid -eq $b.sbid) { continue }
+            if (-not (Test-SamePerson $a.pessoa $b.pessoa)) { continue }
+            $ta = $tok[$a.sbid]; $tb = $tok[$b.sbid]
+            if ($ta.Count -eq 0 -or $tb.Count -eq 0) { continue }
+            $inter = @($ta | Where-Object { $tb -contains $_ })
+            if ($inter.Count -lt 2) { continue }
+            $minCount = [Math]::Min($ta.Count, $tb.Count)
+            $ovl = [double]$inter.Count / [double]$minCount
+            if ($ovl -lt $fuzzyThreshold) { continue }
+
+            # vencedor = nao-concluido > userTouched > maior prio > mais recente
+            $aTouched = ($a.PSObject.Properties.Name -contains 'userTouched') -and $a.userTouched
+            $bTouched = ($b.PSObject.Properties.Name -contains 'userTouched') -and $b.userTouched
+            $takeB = $false
+            if ($a.done -and -not $b.done) { $takeB = $true }
+            elseif ((-not $a.done) -eq (-not $b.done)) {
+                if ($bTouched -and -not $aTouched) { $takeB = $true }
+                elseif ($bTouched -eq $aTouched) {
+                    if ((Prio-Rank $b.prioridade) -gt (Prio-Rank $a.prioridade)) { $takeB = $true }
+                    elseif ([string]$b.updatedAt -gt [string]$a.updatedAt) { $takeB = $true }
+                }
+            }
+            $winner = if ($takeB) { $b } else { $a }
+            $loser  = if ($takeB) { $a } else { $b }
+
+            # une fontes; preserva notas (concatena se ambas tiverem); createdAt = min
+            $winner.fontes = @(@($winner.fontes) + @($loser.fontes) | Select-Object -Unique)
+            if ($loser.notas) {
+                if (-not $winner.notas) { $winner.notas = $loser.notas }
+                elseif ($winner.notas -ne $loser.notas) { $winner.notas = ($winner.notas.TrimEnd() + "`n" + $loser.notas) }
+            }
+            $lt = ($loser.PSObject.Properties.Name -contains 'userTouched') -and $loser.userTouched
+            $wt = ($winner.PSObject.Properties.Name -contains 'userTouched') -and $winner.userTouched
+            if ($lt -or $wt) { $winner.userTouched = $true }
+            if ($loser.createdAt -and (-not $winner.createdAt -or [string]$loser.createdAt -lt [string]$winner.createdAt)) {
+                $winner.createdAt = $loser.createdAt
+            }
+            $winner.history = @(@($winner.history) + @("[$nowIso] fundido duplicado (ovl=$([Math]::Round($ovl,2))): $($loser.assunto)"))
+
+            $removed[$loser.sbid] = $true
+            $mergedCount++
+            Log ("  dedup fuzzy (ovl=$([Math]::Round($ovl,2))): '" + $loser.assunto + "' -> '" + $winner.assunto + "'") Yellow
+            if ($loser.sbid -eq $a.sbid) { break }   # 'a' virou loser: sai do inner loop
+        }
+    }
+    if ($removed.Count -gt 0) {
+        $store = @($items | Where-Object { -not $removed.ContainsKey($_.sbid) })
+        Log "Duplicatas fundidas por similaridade: $mergedCount." Yellow
+    }
 }
 
 $byId = @{}
@@ -985,6 +1138,30 @@ else {
     }
     Write-LastSuccessRun $nowIso $chanMarks
     Log "Marco de ultima rodada com sucesso atualizado (global + por canal): $nowIso" DarkGray
+
+    # CORRECAO 2 - promocao do cursor de analise do WhatsApp.
+    # O analyzer NAO commita o offset: ele so gravou pendingUpperBound. Aqui,
+    # DEPOIS de persistir o store (Write-Store) e consolidar com sucesso, e SO se
+    # o canal WhatsApp deu OK nesta rodada, promovemos analysisOffset =
+    # pendingUpperBound. Se o WhatsApp falhou/pulou, o offset NAO avanca -> a
+    # proxima rodada reprocessa exatamente o mesmo lote (dedup por SBID no merge
+    # impede cards duplicados). Nada e perdido em silencio.
+    if ([string]$channelStatus["WhatsApp"] -like "OK*") {
+        try {
+            $waAnalysisState = Join-Path $Root "WhatsApp\whatsapp-analysis-state.json"
+            if (Test-Path $waAnalysisState) {
+                $wo = Get-Content $waAnalysisState -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($null -ne $wo.pendingUpperBound) {
+                    $promoted = [int]$wo.pendingUpperBound
+                    $wo.analysisOffset = $promoted
+                    $wo.pendingUpperBound = $null
+                    $wo | Add-Member -NotePropertyName updatedAt -NotePropertyValue $nowIso -Force
+                    [IO.File]::WriteAllText($waAnalysisState, ($wo | ConvertTo-Json -Depth 10), $Utf8NoBom)
+                    Log "WhatsApp: cursor de analise promovido -> analysisOffset=$promoted (pendingUpperBound limpo)." DarkGray
+                }
+            }
+        } catch { Log "WhatsApp: falha ao promover cursor de analise: $($_.Exception.Message)" Yellow }
+    }
 }
 
 if ($InitialLoad -and $reviewItems.Count -gt 0) {

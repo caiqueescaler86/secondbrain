@@ -327,7 +327,8 @@ function Handle-PostTask($ctx, [string]$sbid) {
 
 # --- Joule (assincrono) ------------------------------------------------------
 # O Joule Desktop e dirigido por CDP (joule-terminal.ps1) e a resposta pode
-# levar ate ~2min (ele le e-mail/calendario via tool-call). Como o HttpListener
+# levar varios minutos em consultas pesadas (executivo multi-cliente: le
+# e-mail/calendario via tool-call). Como o HttpListener
 # e single-thread, NAO da pra proxiar inline (travaria o cockpit inteiro).
 # Solucao: POST /api/joule dispara um processo separado e volta na hora com um
 # id; o browser faz poll em GET /api/joule/{id}. O board nunca congela.
@@ -335,7 +336,7 @@ $JouleScript = Join-Path $Root "joule-terminal.ps1"
 $JouleTmp    = Join-Path $Processed "joule-jobs"
 if (-not (Test-Path $JouleTmp)) { New-Item -ItemType Directory -Path $JouleTmp -Force | Out-Null }
 $script:JouleJobs   = @{}
-$script:JouleMaxSec = 210   # guarda-chuva: mata o job se passar disso
+$script:JouleMaxSec = 450   # guarda-chuva de seguranca: so mata se o processo pendurar (acima do -TimeoutSec interno, que devolve resposta/erro proprio antes)
 
 function Handle-JouleAsk($ctx) {
     $reader = New-Object System.IO.StreamReader($ctx.Request.InputStream, [Text.Encoding]::UTF8)
@@ -365,7 +366,7 @@ function Handle-JouleAsk($ctx) {
                 "-NoProfile", "-ExecutionPolicy", "Bypass",
                 "-File", $JouleScript,
                 "-PromptFile", $promptFp,
-                "-TimeoutSec", "180"
+                "-TimeoutSec", "420"
             ) `
             -RedirectStandardOutput $outFp `
             -RedirectStandardError  $errFp `

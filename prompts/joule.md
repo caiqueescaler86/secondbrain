@@ -27,6 +27,14 @@ Regras:
 - fonte: "email" ou "calendario".
 - reuniao_em: preencha só quando status="preparar" (ISO "YYYY-MM-DDTHH:mm").
 
+Regra de omissão (NÃO gere card sem ação):
+- Se não há ação pendente, omita o item. Nunca inclua `proxima_acao` = "nenhuma ação", "n/a" ou similar.
+
+Pendências JÁ abertas (para NÃO duplicar):
+{{ABERTAS}}
+- Se um e-mail/reunião se refere a uma pendência já listada acima, REUTILIZE exatamente o mesmo `assunto` e `pessoa` da lista — assim o sistema reconhece como o MESMO item e não cria duplicata. Não reescreva com outras palavras.
+- Só crie item novo para assuntos genuinamente novos (fora da lista acima).
+
 RESPONDA APENAS COM UM ARRAY JSON VÁLIDO, sem texto antes ou depois, sem cercas de código. Cada elemento:
 
 {

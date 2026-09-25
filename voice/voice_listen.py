@@ -109,13 +109,15 @@ def acquire_single_instance():
 # Sem console em producao (usar pythonw.exe).
 # ---------------------------------------------------------------------
 class Indicator:
-    def __init__(self):
+    def __init__(self, cancel_event=None):
         import tkinter as tk
         self._tk   = tk
         self.q     = queue.Queue()
         self._hide_after = None
         self._drag_x = 0
         self._drag_y = 0
+        # Evento compartilhado com a thread de captura: o X seta -> aborta.
+        self.cancel_event = cancel_event
 
         self.root = tk.Tk()
         self.root.overrideredirect(True)
@@ -161,6 +163,17 @@ class Indicator:
                                  font=("Segoe UI", 7),
                                  bg="#0e1117", fg="#404060", anchor="w")
         self._sub_lbl.grid(row=1, column=1, sticky="w")
+
+        # Botao X: fecha a janelinha E cancela a gravacao/transcricao em curso.
+        # So aparece nos estados "listening"/"processing" (ha o que cancelar).
+        self._close_lbl = tk.Label(frame, text="✕",
+                                   font=("Segoe UI", 9, "bold"),
+                                   bg="#0e1117", fg="#606080", cursor="hand2")
+        self._close_lbl.grid(row=0, column=2, rowspan=2, sticky="ne", padx=(10, 0))
+        self._close_lbl.bind("<Button-1>", self._on_close)
+        self._close_lbl.bind("<Enter>", lambda e: self._close_lbl.config(fg="#ff5050"))
+        self._close_lbl.bind("<Leave>", lambda e: self._close_lbl.config(fg="#606080"))
+        self._close_lbl.grid_remove()   # oculto ate haver captura em curso
 
         # Posicao padrao: canto inferior direito
         self.root.update_idletasks()
@@ -226,31 +239,48 @@ class Indicator:
     def _do_hide(self):
         self._hide_after = None
         try:
+            self._close_lbl.grid_remove()
+        except Exception:
+            pass
+        try:
             self.root.withdraw()
         except Exception:
             pass
 
+    def _on_close(self, _event=None):
+        # X clicado: sinaliza o cancelamento p/ a thread de captura (solta o
+        # mic / mata o whisper) e some com a janelinha imediatamente.
+        if self.cancel_event is not None:
+            self.cancel_event.set()
+        log("captura/transcricao cancelada pelo usuario (X)")
+        self._do_hide()
+
     def _handle(self, kind, text):
         if kind == "listening":
             self._show()
+            self._close_lbl.grid()
             self._main_lbl.config(text="●  Ouvindo (local)", fg="#ff5050")
             self._sub_lbl.config(text="fale seu pedido…", fg="#9a4040")
         elif kind == "processing":
             self._show()
+            self._close_lbl.grid()
             self._main_lbl.config(text="⧗  transcrevendo…", fg="#e0a000")
             self._sub_lbl.config(text="processando local", fg="#806020")
         elif kind == "done":
             self._show()
+            self._close_lbl.grid_remove()
             self._main_lbl.config(text="\U0001f3af  anotei", fg="#38c172")
             self._sub_lbl.config(text=(text or "")[:52], fg="#206040")
             self._schedule_hide(3000)
         elif kind == "dup":
             self._show()
+            self._close_lbl.grid_remove()
             self._main_lbl.config(text="↺  ja existia", fg="#7aa2ff")
             self._sub_lbl.config(text=(text or "")[:52], fg="#405080")
             self._schedule_hide(3000)
         elif kind == "error":
             self._show()
+            self._close_lbl.grid_remove()
             self._main_lbl.config(text="⚠  " + (text or "erro"), fg="#e0a000")
             self._sub_lbl.config(text="veja voice.log", fg="#806020")
             self._schedule_hide(3500)
@@ -272,9 +302,9 @@ def _rms(frame):
     return float(np.sqrt(np.mean(x * x)))
 
 
-def record_until_silence(cfg, ui):
+def record_until_silence(cfg, ui, cancel_event=None):
     """Grava do mic ate ~2s de silencio (apos comecar a fala). Retorna
-    ndarray int16 mono ou None (nada dito / erro)."""
+    ndarray int16 mono ou None (nada dito / erro / cancelado pelo X)."""
     import numpy as np
     import sounddevice as sd
 
@@ -303,6 +333,9 @@ def record_until_silence(cfg, ui):
             log("VAD: ruido=%.0f limiar=%.0f" % (noise, threshold))
 
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    log("gravacao cancelada pelo usuario (X)")
+                    return None
                 data, _ = stream.read(frame_len)
                 frame = data[:, 0]
                 collected.append(frame.copy())
@@ -346,7 +379,7 @@ def _safe_rm(p):
         pass
 
 
-def transcribe(cfg, audio):
+def transcribe(cfg, audio, cancel_event=None):
     import numpy as np  # noqa: F401  (audio ja e ndarray)
     sr = int(cfg["sample_rate"])
     exe = cfg.get("whisper_exe", "")
@@ -381,14 +414,42 @@ def transcribe(cfg, audio):
     if lang and lang != "auto":
         args += ["-l", lang]
 
+    # Popen + poll para poder MATAR o whisper se o usuario clicar no X.
     try:
-        subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=180)
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
     except Exception as e:
-        log("whisper falhou: %s" % e)
+        log("whisper falhou ao iniciar: %s" % e)
         _safe_rm(wav)
         _safe_rm(txt)
         return None
+
+    waited = 0.0
+    while True:
+        try:
+            proc.wait(timeout=0.2)
+            break  # whisper terminou
+        except subprocess.TimeoutExpired:
+            pass
+        waited += 0.2
+        if cancel_event is not None and cancel_event.is_set():
+            log("transcricao cancelada pelo usuario (X); encerrando whisper")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            _safe_rm(wav)
+            _safe_rm(txt)
+            return None
+        if waited >= 180:
+            log("whisper timeout (180s); encerrando")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            _safe_rm(wav)
+            _safe_rm(txt)
+            return None
 
     text = ""
     if os.path.exists(txt):
@@ -527,14 +588,24 @@ def create_task(cfg, fields):
 # ---------------------------------------------------------------------
 # Pipeline completo de uma captura (gatilho -> card).
 # ---------------------------------------------------------------------
-def handle_capture(cfg, ui):
-    audio = record_until_silence(cfg, ui)
+def handle_capture(cfg, ui, cancel_event=None):
+    # Zera o sinal de cancelamento antes de comecar uma captura nova.
+    if cancel_event is not None:
+        cancel_event.clear()
+
+    audio = record_until_silence(cfg, ui, cancel_event)
     if audio is None:
+        ui.post("hide")
+        return
+    if cancel_event is not None and cancel_event.is_set():
         ui.post("hide")
         return
 
     ui.post("processing")
-    text = transcribe(cfg, audio)
+    text = transcribe(cfg, audio, cancel_event)
+    if cancel_event is not None and cancel_event.is_set():
+        ui.post("hide")
+        return
     if not text:
         log("transcricao vazia")
         ui.post("error", "não entendi o áudio")
@@ -611,7 +682,7 @@ def try_load_wakeword(cfg):
 # Worker principal: aguarda gatilho (wake word + hotkey) e captura.
 # Roda em thread separado; o mic so e aberto durante a espera/captura.
 # ---------------------------------------------------------------------
-def main_worker(cfg, ui, trigger_event):
+def main_worker(cfg, ui, trigger_event, cancel_event=None):
     oww = try_load_wakeword(cfg)
     sr = int(cfg["sample_rate"])
     chunk = 1280  # 80ms @ 16k, tamanho recomendado pelo openWakeWord
@@ -654,7 +725,7 @@ def main_worker(cfg, ui, trigger_event):
 
         log("gatilho: %s" % triggered_by)
         try:
-            handle_capture(cfg, ui)
+            handle_capture(cfg, ui, cancel_event)
         except Exception as e:
             log("erro no handle_capture: %s" % e)
             ui.post("error", "erro interno")
@@ -735,14 +806,18 @@ def main():
         return
 
     log("=== SecondBrain voice listener iniciado ===")
-    ui = Indicator()
+    # Evento de cancelamento compartilhado: o X da janelinha seta -> a thread
+    # de captura solta o mic / mata o whisper.
+    cancel_event = threading.Event()
+    ui = Indicator(cancel_event)
 
     start_tray()
 
     trigger_event = threading.Event()
     start_hotkey(cfg, trigger_event)
 
-    worker = threading.Thread(target=main_worker, args=(cfg, ui, trigger_event),
+    worker = threading.Thread(target=main_worker,
+                              args=(cfg, ui, trigger_event, cancel_event),
                               daemon=True)
     worker.start()
 

@@ -26,6 +26,14 @@ Regras:
 - fonte: "teams", "transcricao" ou "email".
 - reuniao_em: só quando status="preparar".
 
+Regra de omissão (NÃO gere card sem ação):
+- Se não há ação pendente, omita o item. Nunca inclua `proxima_acao` = "nenhuma ação", "n/a" ou similar.
+
+Pendências JÁ abertas (para NÃO duplicar):
+{{ABERTAS}}
+- Se um item se refere a uma pendência já listada acima, REUTILIZE exatamente o mesmo `assunto` e `pessoa` da lista — assim o sistema reconhece como o MESMO item e não cria duplicata. Não reescreva com outras palavras.
+- Só crie item novo para assuntos genuinamente novos (fora da lista acima).
+
 Sua resposta deve ser APENAS um array JSON válido — sem texto antes ou depois, sem markdown, sem cercas de código, sem "aqui está" e sem versão otimizada do pedido. Cada elemento:
 
 {
