@@ -643,6 +643,13 @@ function Collect-Loaded([string]$ChatName) {
      let parts=[...e.querySelectorAll(".selectable-text")].map(x=>clean(x.innerText||x.textContent)).filter(Boolean);
      let text=clean([...new Set(parts)].join(" "));
      if(!text) text=clean(e.innerText);
+     if(!text){
+       const aud=e.querySelector("audio");
+       if(aud){
+         const dur=e.querySelector("[data-duration]")||e.querySelector(".audio-playback-duration");
+         text=dur?"[áudio "+clean(dur.innerText||dur.textContent)+"]":"[áudio]";
+       }
+     }
      if(!text) return;
      const k=meta+"|"+text+"|"+dir(e);
      if(seen.has(k)) return; seen.add(k);
