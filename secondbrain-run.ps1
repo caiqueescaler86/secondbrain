@@ -1,5 +1,5 @@
 param(
-    [switch]$SkipJoule,
+    [switch]$SkipJoule = $true,   # Joule DESLIGADO por padrao: joule.md so cobre e-mail/calendario = redundante com o Copilot (que ja puxa Teams/transcricoes/e-mail). Religa com -SkipJoule:$false.
     [switch]$SkipCopilot,
     [switch]$SkipWhatsApp,
     [switch]$SkipAudio,
@@ -11,7 +11,8 @@ param(
     [switch]$DryRun,
     [switch]$InitialLoad,
     [ValidateSet("joule","local")]
-    [string]$WhatsAppEngine = "local"
+    [string]$WhatsAppEngine = "local",
+    [switch]$NoLaya = $true    # Laya (filtro pre-Qwen) DESLIGADO por padrao: multilingual nao-calibrado fere a regra de ouro em reuniao. Religa com -NoLaya:$false (so depois de calibrar).
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,6 +82,64 @@ function Log([string]$Text, [ConsoleColor]$Color = "Gray") {
 
 Log "=== SecondBrain run $ts ===" Cyan
 Log ("Modo: " + $(if ($InitialLoad) { "CARGA INICIAL" } else { "diario" }) + $(if ($DryRun) { " (DryRun)" } else { "" }) + " | data-base: $today") Cyan
+
+# ============================================================
+# RUN-STATUS AO VIVO (WC) - o cockpit le processed\run-status.json a cada 5s.
+#   Escrito no inicio, a cada passo e no fim. Best-effort: qualquer erro aqui
+#   NUNCA derruba a rodada (envolto em try/catch mudo).
+# ============================================================
+$RunStatusFile  = Join-Path $Processed "run-status.json"
+$RunHistoryFile = Join-Path $Processed "run-history.jsonl"
+$HeavyQueueFile = Join-Path $Processed "heavy-queue.json"
+$script:runStartedAt = (Get-Date).ToString("o")
+$script:currentStep  = "preflight"
+$script:runStepMs    = [ordered]@{}
+
+function Parse-ChannelStatus([string]$s) {
+    if ([string]::IsNullOrWhiteSpace($s)) { return @{ status = "pendente"; items = $null; error = $null } }
+    if ($s -match '^OK \((\d+)\s*iten')   { return @{ status = "ok";    items = [int]$Matches[1]; error = $null } }
+    if ($s -match '^FALHOU:\s*(.*)$')      { return @{ status = "fail";  items = $null; error = $Matches[1] } }
+    if ($s -match '^pulado')               { return @{ status = "skip";  items = $null; error = $null } }
+    return @{ status = $s; items = $null; error = $null }
+}
+
+function Read-LayaSidecar([string]$name) {
+    $f = Join-Path $Processed $name
+    if (Test-Path $f) { try { return (Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json) } catch {} }
+    return $null
+}
+
+function Save-RunStatus([string]$Status = "running") {
+    try {
+        $chan = [ordered]@{}
+        foreach ($k in @("Joule", "Copilot", "WhatsApp", "Meetings")) {
+            $p = Parse-ChannelStatus ([string]$channelStatus[$k])
+            $ms = if ($script:runStepMs.Contains($k)) { [int]$script:runStepMs[$k] } else { $null }
+            $chan[$k.ToLower()] = [ordered]@{ status = $p.status; items = $p.items; ms = $ms; error = $p.error }
+        }
+        $lw = Read-LayaSidecar "laya-whatsapp.json"
+        $lm = Read-LayaSidecar "laya-meetings.json"
+        $available = (($lw -and $lw.available) -or ($lm -and $lm.available))
+        $savedVals = @()
+        if ($lw) { $savedVals += [double]$lw.qwenInputSavedPct }
+        if ($lm) { $savedVals += [double]$lm.qwenInputSavedPct }
+        $savedPct = if ($savedVals.Count) { [math]::Round(($savedVals | Measure-Object -Average).Average, 1) } else { 0 }
+        $laya = [ordered]@{
+            available         = [bool]$available
+            filteredChats     = if ($lw) { [int]$lw.chatsFiltered } else { 0 }
+            filteredChunks    = if ($lm) { [int]$lm.chunksFiltered } else { 0 }
+            qwenInputSavedPct = $savedPct
+        }
+        $obj = [ordered]@{
+            version = 1; runId = $ts; startedAt = $script:runStartedAt; updatedAt = (Get-Date).ToString("o")
+            status = $Status; currentStep = $script:currentStep; pid = $PID; channels = $chan; laya = $laya
+        }
+        [System.IO.File]::WriteAllText($RunStatusFile, ($obj | ConvertTo-Json -Depth 8), $Utf8NoBom)
+    } catch {}
+}
+
+# Marca o passo atual e persiste (chamado no inicio de cada canal).
+function Set-Step([string]$Name) { $script:currentStep = $Name; Save-RunStatus "running" }
 
 # ============================================================
 # PREFLIGHT - garante que os apps dos canais estao ABERTOS
@@ -374,10 +433,20 @@ function Extract-JsonArray([string]$text) {
     if ($start -lt 0) { return $null }
     $body = $clean.Substring($start)
 
+    # Helper: retorna o resultado de ConvertFrom-Json como array sem o bug de embrulho duplo.
+    # CRITICO: ,@($parsed) quando $parsed ja e Object[N>1] cria Object[1]{Object[N]} ->
+    # foreach itera 1x -> [string]$it.campo concatena N valores -> mega-card com tudo junto.
+    # Fix: ,@() so para o caso vazio (PS5: ConvertFrom-Json("[]") retorna $null, nao @());
+    # para N>=1 retorna $parsed direto (o pipeline do PS serializa cada item corretamente).
+    function Wrap-Parsed($parsed) {
+        if ($null -eq $parsed) { return ,@() }   # [] legitimo -> array vazio, nao $null
+        return $parsed                             # Object[N] ou PSCustomObject: retorna como esta
+    }
+
     # 1) array completo (primeiro '[' ate o ultimo ']')
     $end = $body.LastIndexOf(']')
     if ($end -gt 0) {
-        try { return @($body.Substring(0, $end + 1) | ConvertFrom-Json) } catch {}
+        try { return Wrap-Parsed ($body.Substring(0, $end + 1) | ConvertFrom-Json) } catch {}
     }
 
     # 2) reparo p/ resposta truncada (Joule/Copilot as vezes cortam saidas
@@ -385,7 +454,7 @@ function Extract-JsonArray([string]$text) {
     #    salvando os itens integros em vez de perder a rodada inteira.
     $lastObj = $body.LastIndexOf('}')
     while ($lastObj -gt 0) {
-        try { return @(($body.Substring(0, $lastObj + 1) + ']') | ConvertFrom-Json) } catch {}
+        try { return Wrap-Parsed (($body.Substring(0, $lastObj + 1) + ']') | ConvertFrom-Json) } catch {}
         $lastObj = $body.LastIndexOf('}', $lastObj - 1)
     }
     return $null
@@ -416,7 +485,7 @@ function Invoke-Capture([scriptblock]$Block) {
 # governanca ("politicas da sua organizacao" / "organization policies") - que e
 # transitorio. Nao repete em outros erros (ex.: LLM local lento), pra nao
 # reprocessar analises caras a toa.
-function Invoke-JsonWithRetry([scriptblock]$Block, [int]$Tries = 2, [int]$WaitSec = 6) {
+function Invoke-JsonWithRetry([scriptblock]$Block, [int]$Tries = 2, [int]$WaitSec = 6, [switch]$AnyError) {
     $cap = $null
     for ($i = 1; $i -le $Tries; $i++) {
         $cap = Invoke-Capture $Block
@@ -425,8 +494,12 @@ function Invoke-JsonWithRetry([scriptblock]$Block, [int]$Tries = 2, [int]$WaitSe
             return [pscustomobject]@{ Text = $cap.Text; Err = $cap.Err; Arr = $arr }
         }
         $isPolicy = $cap.Text -match '(?i)pol[ií]tic.{0,40}organiza|organization.{0,20}polic'
-        if ($isPolicy -and $i -lt $Tries) {
-            Log "  soluco de governanca do Joule; nova tentativa em ${WaitSec}s..." DarkYellow
+        # -AnyError: re-tenta em QUALQUER falha real (nao so soluco de governanca).
+        # Usado pelo WhatsApp: uma falha (ex.: hiccup do llama num lote) nao pode
+        # derrubar o canal em silencio; tenta mais uma vez antes de desistir.
+        if (($isPolicy -or $AnyError) -and $i -lt $Tries) {
+            $motivo = if ($isPolicy) { "soluco de governanca do Joule" } else { "falha na analise (Arr vazio)" }
+            Log "  $motivo; nova tentativa em ${WaitSec}s..." DarkYellow
             Start-Sleep -Seconds $WaitSec
             continue
         }
@@ -554,6 +627,9 @@ try {
 # ============================================================
 # CANAL: JOULE
 # ============================================================
+Save-RunStatus "running"
+$script:currentStep = "Joule"; Save-RunStatus "running"
+$swJoule = [System.Diagnostics.Stopwatch]::StartNew()
 if (-not $SkipJoule) {
     try {
         $tpl = Get-Content (Join-Path $PromptsDir "joule.md") -Raw -Encoding UTF8
@@ -578,10 +654,13 @@ if (-not $SkipJoule) {
     }
 }
 else { $channelStatus["Joule"] = "pulado" }
+$swJoule.Stop(); $script:runStepMs["Joule"] = $swJoule.ElapsedMilliseconds; Save-RunStatus "running"
 
 # ============================================================
 # CANAL: COPILOT
 # ============================================================
+$script:currentStep = "Copilot"; Save-RunStatus "running"
+$swCopilot = [System.Diagnostics.Stopwatch]::StartNew()
 if (-not $SkipCopilot) {
     try {
         $tpl = Get-Content (Join-Path $PromptsDir "copilot.md") -Raw -Encoding UTF8
@@ -608,10 +687,13 @@ if (-not $SkipCopilot) {
     }
 }
 else { $channelStatus["Copilot"] = "pulado" }
+$swCopilot.Stop(); $script:runStepMs["Copilot"] = $swCopilot.ElapsedMilliseconds; Save-RunStatus "running"
 
 # ============================================================
 # CANAL: WHATSAPP (coletor incremental + analise JSON local)
 # ============================================================
+$script:currentStep = "WhatsApp"; Save-RunStatus "running"
+$swWhats = [System.Diagnostics.Stopwatch]::StartNew()
 # O motor local do WhatsApp (e reunioes) depende do llama-server. Se ele
 # estiver fechado, sobe sozinho aqui (start-llama.ps1 e idempotente: nao
 # duplica se ja estiver no ar). Assim a rodada agendada nao falha calada
@@ -678,13 +760,19 @@ if (-not $SkipWhatsApp) {
         # a promocao de analysisOffset acontece adiante, so apos consolidar.
         $waArgs = @{ Days = $waDays; Json = $true; Engine = $WhatsAppEngine; UseOffset = $true }
         if ($openContextFile) { $waArgs.OpenContextFile = $openContextFile }
-        $cap = Invoke-JsonWithRetry { & $AnalyzePs @waArgs }
+        if ($NoLaya) { $waArgs.NoLaya = $true }
+        $cap = Invoke-JsonWithRetry { & $AnalyzePs @waArgs } -Tries 2 -WaitSec 8 -AnyError
         $rawFile = Join-Path $RawDir "whatsapp-$ts.json"
         [System.IO.File]::WriteAllText($rawFile, $cap.Text, [Text.Encoding]::UTF8)
 
         $arr = $cap.Arr
         if ($null -eq $arr) {
-            throw "JSON nao extraido da analise do WhatsApp." + $(if ($cap.Err) { " " + $cap.Err } else { "" })
+            # Falha REAL (parse nao achou array / analyzer abortou) - distinta de
+            # "vazio valido" ([] chega como @() e passa direto). Ja re-tentou 1x
+            # acima (-AnyError). Nao promovemos offset (a rodada seguinte refaz);
+            # o motivo vai pro log e pro run-status, nunca cai em silencio.
+            $motivo = if ($cap.Err) { $cap.Err.Trim() } else { "sem detalhe (stdout so trouxe BOM/vazio)" }
+            throw "JSON nao extraido da analise do WhatsApp (apos retry). Motivo: $motivo"
         }
         foreach ($it in $arr) { [void]$allItems.Add($it) }
         $channelStatus["WhatsApp"] = "OK ($($arr.Count) itens)"
@@ -696,14 +784,19 @@ if (-not $SkipWhatsApp) {
     }
 }
 else { $channelStatus["WhatsApp"] = "pulado" }
+$swWhats.Stop(); $script:runStepMs["WhatsApp"] = $swWhats.ElapsedMilliseconds; Save-RunStatus "running"
 
 # ============================================================
 # CANAL: MEETINGS (detector de reuniao: calendario + transcricoes locais)
 # ============================================================
+$script:currentStep = "Meetings"; Save-RunStatus "running"
+$swMeet = [System.Diagnostics.Stopwatch]::StartNew()
 if (-not $SkipMeetings) {
     try {
         Log "Meetings: lendo calendario (proximos $meetingAhead dia(s)) e transcricoes..." Cyan
-        $cap = Invoke-Capture { & $MeetingDetectorPs -Ahead $meetingAhead -Json }
+        $mdArgs = @{ Ahead = $meetingAhead; Json = $true }
+        if ($NoLaya) { $mdArgs.NoLaya = $true }
+        $cap = Invoke-Capture { & $MeetingDetectorPs @mdArgs }
         $rawFile = Join-Path $RawDir "meetings-$ts.json"
         [System.IO.File]::WriteAllText($rawFile, $cap.Text, [Text.Encoding]::UTF8)
 
@@ -721,6 +814,7 @@ if (-not $SkipMeetings) {
     }
 }
 else { $channelStatus["Meetings"] = "pulado" }
+$swMeet.Stop(); $script:runStepMs["Meetings"] = $swMeet.ElapsedMilliseconds; $script:currentStep = "consolidando"; Save-RunStatus "running"
 
 Log "Total de itens crus coletados: $($allItems.Count)." Gray
 
@@ -741,10 +835,22 @@ foreach ($raw in $allItems) {
         continue
     }
 
-    $status = ([string]$raw.status).ToLower().Trim()
+    # Sanitizacao defensiva: o LLM ocasionalmente concatena N itens num unico
+    # objeto com campos separados por espacos ("fazer responder fazer fazer",
+    # "whatsapp whatsapp whatsapp"). Extraimos so o PRIMEIRO valor valido de
+    # cada campo de vocabulario fixo; o restante do item e descartado. Isso
+    # evita que status/canal/tipo invalidos propaguem para o tasks.json.
+    $validStatus = @("fazer","responder","cobrar","aguardando","preparar","risco","referencia")
+    $statusRaw = ([string]$raw.status).ToLower().Trim()
+    $status = ($statusRaw -split '\s+' | Where-Object { $_ -in $validStatus } | Select-Object -First 1)
     if ([string]::IsNullOrWhiteSpace($status)) { $status = "fazer" }
-    $canal  = ([string]$raw.canal).ToLower().Trim()
-    $tipo   = ([string]$raw.tipo).ToLower().Trim()
+
+    $canalRaw = ([string]$raw.canal).ToLower().Trim()
+    $canal = ($canalRaw -split '\s+' | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($canal)) { $canal = "desconhecido" }
+
+    $tipoRaw = ([string]$raw.tipo).ToLower().Trim()
+    $tipo = ($tipoRaw -split '\s+' | Select-Object -First 1)
     if ([string]::IsNullOrWhiteSpace($tipo)) { $tipo = "trabalho" }
 
     $pessoa  = if ($raw.pessoa -and "$($raw.pessoa)" -ne "null") { [string]$raw.pessoa } else { "" }
@@ -1183,6 +1289,45 @@ foreach ($k in $channelStatus.Keys) {
 Log ("  Novas: {0} | Atualizadas: {1} | Roladas: {2} | Revisao: {3}" -f $stats.new, $stats.updated, $stats.rolled, $stats.review) Gray
 Log ("  Snapshot incremental: {0} itens novos/alterados desde {1}" -f $deltaItems.Count, $sinceLabel) Gray
 Log "=============================" Cyan
+
+# ============================================================
+# RUN-STATUS: finalizacao (WC)
+#   Marca a rodada como done/failed, escreve o snapshot final e anexa uma
+#   linha ao historico (run-history.jsonl, lido pelo cockpit). Garante que
+#   heavy-queue.json exista para a rota do cockpit nao quebrar.
+# ============================================================
+$anyFail = $false
+foreach ($k in @("Joule","Copilot","WhatsApp","Meetings")) {
+    if ([string]$channelStatus[$k] -like "FALHOU*") { $anyFail = $true }
+}
+$script:currentStep = "fim"
+Save-RunStatus $(if ($anyFail) { "done_with_errors" } else { "done" })
+
+try {
+    # historico: 1 linha JSON por rodada (o cockpit le as ultimas ~20).
+    $histChan = [ordered]@{}
+    foreach ($k in @("Joule","Copilot","WhatsApp","Meetings")) {
+        $p = Parse-ChannelStatus ([string]$channelStatus[$k])
+        $histChan[$k.ToLower()] = [ordered]@{ status = $p.status; items = $p.items; error = $p.error }
+    }
+    $histLine = [ordered]@{
+        runId = $ts; startedAt = $script:runStartedAt; finishedAt = (Get-Date).ToString("o")
+        status = $(if ($anyFail) { "done_with_errors" } else { "done" })
+        channels = $histChan
+        stats = [ordered]@{ new = $stats.new; updated = $stats.updated; rolled = $stats.rolled; review = $stats.review }
+    }
+    Add-Content -Path $RunHistoryFile -Value ($histLine | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
+} catch { Log "AVISO: nao consegui anexar run-history.jsonl: $($_.Exception.Message)" DarkGray }
+
+try {
+    # heavy-queue.json: estrutura informativa (itens grandes p/ o usuario decidir
+    # quando reprocessar). Hoje so garantimos o arquivo; a populacao/acao de
+    # reprocesso e um proximo passo (o botao "processar" do cockpit e placeholder).
+    if (-not (Test-Path $HeavyQueueFile)) {
+        $hq = [ordered]@{ version = 1; updatedAt = (Get-Date).ToString("o"); items = @() }
+        [System.IO.File]::WriteAllText($HeavyQueueFile, ($hq | ConvertTo-Json -Depth 5), $Utf8NoBom)
+    }
+} catch {}
 
 # ============================================================
 # COCKPIT
