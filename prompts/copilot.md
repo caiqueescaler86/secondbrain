@@ -1,16 +1,22 @@
-Pesquise AGORA nos meus dados do Microsoft 365 (chats e canais do Teams, transcrições de reunião e e-mails) da janela {{JANELA}} e me devolva os itens operacionais. NÃO reescreva, NÃO otimize e NÃO comente este pedido: execute a busca e responda apenas com o resultado no formato pedido abaixo.
+Você vai executar uma busca real nos meus dados do Microsoft 365. ETAPA 1: busque agora — e-mails, mensagens do Teams (1:1, grupos, canais), transcrições de reunião da janela {{JANELA}}, e compromissos do calendário do próximo dia útil. ETAPA 2: para cada item encontrado que envolva Caíque Escaler ou Emarsys, aplique as regras abaixo. ETAPA 3: formate o resultado como JSON. NÃO pule a ETAPA 1. Se não encontrar nada após buscar, responda []. NÃO otimize nem reescreva este pedido.
 
-Considere só o que exige ação, dependência, prazo, risco ou acompanhamento. Use e-mail como segunda fonte para validar/complementar o que vier de Teams e transcrições (cross-check). Elimine duplicidades entre as fontes. Revise com cautela para não faltar dados.
+Considere só o que exige ação, dependência, prazo, risco ou acompanhamento. Trate e-mail e calendário como fontes PRIMÁRIAS (no mesmo nível de Teams/transcrições), não apenas cross-check: levante pendências, respostas devidas, prazos e riscos que vierem por e-mail, e reuniões do calendário que exijam preparação. Cruze todas as fontes e elimine duplicidades. Revise com cautela para não faltar dados.
 
-Levante:
-1. Action points de transcrições.
-2. Action points de chats do Teams.
-3. Quem eu preciso responder.
-4. Quem precisa me responder.
-5. Pendências abertas.
-6. Prazos.
-7. Riscos.
-8. E-mails pendentes (para cross-check).
+Para Teams (mensagens diretas 1:1, chats em grupo e canais) — siga este passo a passo:
+1. Liste TODAS as conversas dos últimos {{JANELA}} que incluem Caíque Escaler (1:1, grupos e canais).
+2. Para CADA conversa: abra o thread e identifique a última mensagem — quem enviou e o que disse.
+3. Aplique a regra da bola pela última mensagem de cada thread:
+   - Última mensagem de outra pessoa com pergunta, pedido ou tarefa → status "responder" ou "fazer", responsavel "eu".
+   - Minha mensagem foi a última e estou aguardando retorno → status "aguardando" ou "cobrar", responsavel = nome da outra pessoa. **Procure ativamente estas conversas — quem está me devendo resposta é tão importante quanto quem eu devo responder. Se minha última mensagem tem mais de 24h e não veio resposta, prioridade "alta" se houver cliente ou prazo envolvido.**
+   - Menção direta a mim (@Caíque) pedindo algo → status "fazer" ou "responder".
+4. Só então gere os cards — sem abrir o thread completo, não gere o card.
+
+Levante também:
+- Action points de transcrições de reunião.
+- Conversas onde minha última mensagem aguarda resposta há mais de 24h (cobrar).
+- Prazos e riscos identificados em qualquer fonte.
+- E-mails que exigem minha resposta ou ação.
+- Reuniões do próximo dia útil (do calendário) que exijam preparação → status "preparar", com reuniao_em.
 
 Regras:
 - NÃO invente. Se faltar informação, use null.
@@ -23,7 +29,7 @@ Regras:
   - Reavalie a cada nova mensagem: um thread onde eu estava "aguardando" vira "responder" assim que a pessoa me responde pedindo o próximo passo.
 - status: "fazer" (ação minha), "responder", "cobrar", "aguardando", "preparar" (reunião), "risco", "referencia".
 - prioridade: "alta|media|baixa".
-- fonte: "teams", "transcricao" ou "email".
+- fonte: "teams", "transcricao", "email" ou "calendario".
 - reuniao_em: só quando status="preparar".
 
 Regra de omissão (NÃO gere card sem ação):
@@ -48,7 +54,7 @@ Sua resposta deve ser APENAS um array JSON válido — sem texto antes ou depois
   "prazo": "YYYY-MM-DD ou null",
   "prioridade": "alta|media|baixa",
   "risco": "texto ou null",
-  "fonte": "teams|transcricao|email",
+  "fonte": "teams|transcricao|email|calendario",
   "reuniao_em": "YYYY-MM-DDTHH:mm ou null"
 }
 

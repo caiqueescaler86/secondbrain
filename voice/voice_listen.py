@@ -30,6 +30,7 @@ import threading
 import subprocess
 import datetime
 import ctypes
+import atexit
 import urllib.request
 import urllib.error
 
@@ -90,17 +91,74 @@ def load_config():
 # ---------------------------------------------------------------------
 # Instancia unica (evita dois listeners disputando o mic).
 # ---------------------------------------------------------------------
+_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice.lock")
+
+
+def _cleanup_lock():
+    try:
+        if os.path.exists(_LOCK_FILE):
+            with open(_LOCK_FILE, "r") as f:
+                if int(f.read().strip()) == os.getpid():
+                    os.remove(_LOCK_FILE)
+    except Exception:
+        pass
+
+
+def _kill_previous_instance():
+    # Encerra a instância anterior registrada no PID file (automatico no startup).
+    if not os.path.exists(_LOCK_FILE):
+        return
+    try:
+        pid = int(open(_LOCK_FILE).read().strip())
+        if pid == os.getpid():
+            return
+        PROCESS_TERMINATE  = 0x1
+        PROCESS_SYNCHRONIZE = 0x100000
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, False, pid)
+        if h:
+            ctypes.windll.kernel32.TerminateProcess(h, 0)
+            ctypes.windll.kernel32.CloseHandle(h)
+            log("Instancia anterior (PID %d) encerrada automaticamente." % pid)
+            time.sleep(0.4)
+    except Exception as e:
+        log("kill instancia anterior: %s" % e)
+    try:
+        os.remove(_LOCK_FILE)
+    except Exception:
+        pass
+
+
+def _write_pid():
+    try:
+        with open(_LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
+        atexit.register(_cleanup_lock)
+    except Exception as e:
+        log("escrita do PID file falhou: %s" % e)
+
+
 def acquire_single_instance():
+    # Sempre mata a instancia anterior antes de subir (nova versao / reinicio).
+    _kill_previous_instance()
+
+    ERROR_ALREADY_EXISTS = 183
     try:
         kernel32 = ctypes.windll.kernel32
-        handle = kernel32.CreateMutexW(None, False, "Global\\SecondBrainVoiceListener")
-        ERROR_ALREADY_EXISTS = 183
+        # Local\\ nao exige SeCreateGlobalPrivilege (evita falha em ambiente corporativo).
+        handle = kernel32.CreateMutexW(None, False, "Local\\SecondBrainVoiceListener")
         if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            # Corrida improvavel: outra instancia subiu ao mesmo tempo; cedemos.
+            log("Corrida de inicializacao: outra instancia ganhou o mutex; saindo.")
             return None
-        return handle  # manter referencia viva pelo processo todo
+        if handle:
+            _write_pid()
+            return handle
     except Exception as e:
-        log("nao consegui criar mutex (seguindo assim mesmo): %s" % e)
-        return True
+        log("mutex falhou (%s); usando arquivo de lock." % e)
+
+    # Fallback: PID file apenas (mutex bloqueado por politica corporativa).
+    _write_pid()
+    return True
 
 
 # ---------------------------------------------------------------------
