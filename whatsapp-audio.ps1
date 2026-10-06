@@ -681,17 +681,43 @@ function ScrollIntoView-Audio([int]$X, [int]$Y) {
 #   Camada 1: clique CONFIAVEL (Click-Point) no botao -> WA baixa/descriptografa.
 #   Camada 2: play VIA JS mutado (Trigger-PlayJS) -> nao depende da coordenada.
 #   Camada 3: scroll-into-view + clique confiavel de novo (pega fora da viewport).
+function Wait-AudioSrc([int]$X, [int]$Y, [int]$MaxMs = 6000) {
+    # Espera o <audio> mais proximo de (x,y) ganhar um src valido (blob:),
+    # sinalizando que o WhatsApp Web inicializou o elemento. Mensagens antigas
+    # precisam desse tempo apos scrollIntoView antes do clique ser util.
+    $code = @"
+(async()=>{
+ const tx=$X, ty=$Y, deadline=Date.now()+$MaxMs;
+ const near=el=>{const r=el.getBoundingClientRect();return Math.hypot(r.left+r.width/2-tx,r.top+r.height/2-ty);};
+ while(Date.now()<deadline){
+   const hits=[...document.querySelectorAll('audio')].filter(a=>near(a)<200);
+   if(hits.some(a=>a.currentSrc||a.src)) return true;
+   await new Promise(r=>setTimeout(r,300));
+ }
+ return false;
+})()
+"@
+    try { JSAsync $code (([int]$MaxMs / 1000) + 4) | Out-Null } catch {}
+}
+
 function Acquire-Blob($au) {
-    # camada 0
-    if ($au.hasSrc) {
-        $b = Get-AudioBase64 ([int]$au.i)
-        if (-not [string]::IsNullOrWhiteSpace($b)) { return $b }
+    # Passo 0: se o elemento esta na viewport mas sem src (blob nao inicializado),
+    # faz scrollIntoView + espera ate 6s o WA Web carregar o src. Para mensagens
+    # antigas o WA precisa re-requisitar do IndexedDB/servidor apos o elemento
+    # entrar na viewport — sem essa espera, as camadas de clique chegam cedo demais.
+    if (-not $au.hasSrc) {
+        ScrollIntoView-Audio ([int]$au.x) ([int]$au.y)
+        Start-Sleep -Milliseconds 800
+        Wait-AudioSrc ([int]$au.x) ([int]$au.y) 6000
     }
+    # camada 0: blob ja disponivel (hasSrc original ou apos wait acima)
+    $b = Get-AudioBase64 ([int]$au.i)
+    if (-not [string]::IsNullOrWhiteSpace($b)) { return $b }
     # camadas que DISPARAM play: exigem silencio confirmado
     $layers = @(
-        @{ name="clique confiavel"; act={ try { Click-Point ([int]$au.x) ([int]$au.y) } catch {} }; wait=2000 },
-        @{ name="play via JS mutado"; act={ Trigger-PlayJS ([int]$au.x) ([int]$au.y) }; wait=1800 },
-        @{ name="scroll+clique"; act={ ScrollIntoView-Audio ([int]$au.x) ([int]$au.y); Start-Sleep -Milliseconds 400; try { Click-Point ([int]$au.x) ([int]$au.y) } catch {} }; wait=2000 }
+        @{ name="clique confiavel"; act={ try { Click-Point ([int]$au.x) ([int]$au.y) } catch {} }; wait=3000 },
+        @{ name="play via JS mutado"; act={ Trigger-PlayJS ([int]$au.x) ([int]$au.y) }; wait=2500 },
+        @{ name="scroll+clique"; act={ ScrollIntoView-Audio ([int]$au.x) ([int]$au.y); Start-Sleep -Milliseconds 600; try { Click-Point ([int]$au.x) ([int]$au.y) } catch {} }; wait=3000 }
     )
     foreach ($layer in $layers) {
         if (-not (Assert-Silent)) {
