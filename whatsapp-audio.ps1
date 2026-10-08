@@ -42,6 +42,7 @@ $script:ws = $null
 $script:context = $null
 $script:nextId = 1
 $script:sessionCreated = $false
+$script:FirefoxPid = $null   # PID do Firefox que abrimos; null se ja estava no ar
 
 function Log([string]$Text, [ConsoleColor]$Color = "Gray") {
     Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $Text" -ForegroundColor $Color
@@ -64,20 +65,37 @@ function Test-Port {
 # Seguro na rodada: audio e o ULTIMO passo do WhatsApp; nada depois usa o Firefox.
 function Restart-Firefox {
     Log "Reiniciando o Firefox para liberar a sessao BiDi..." Yellow
-    try { Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force } catch {}
-    Start-Sleep -Seconds 2
+    # Matar APENAS o Firefox que o SecondBrain abriu (nao todos os processos firefox).
+    $pidToKill = $script:FirefoxPid
+    if (-not $pidToKill) {
+        try {
+            $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($conn) { $pidToKill = [int]$conn.OwningProcess }
+        } catch {}
+    }
+    if ($pidToKill) {
+        try { Stop-Process -Id $pidToKill -ErrorAction SilentlyContinue } catch {}
+        $exited = -not (Get-Process -Id $pidToKill -ErrorAction SilentlyContinue)
+        if (-not $exited) { Start-Sleep -Seconds 3 }
+        if (-not $exited) {
+            try { Stop-Process -Id $pidToKill -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        Start-Sleep -Seconds 2
+    }
+    $script:FirefoxPid = $null
     if (-not (Test-Path $FirefoxExe)) { throw "firefox.exe nao encontrado em $FirefoxExe (nao consigo reiniciar)." }
-    Start-Process -FilePath $FirefoxExe -ArgumentList @(
-        "-no-remote","-profile",$FirefoxProfile,
-        "--remote-debugging-port=$Port","https://web.whatsapp.com/"
-    )
+    $proc = Start-Process -FilePath $FirefoxExe -ArgumentList @(
+        "-no-remote", "-profile", $FirefoxProfile,
+        "--remote-debugging-port=$Port", "https://web.whatsapp.com/"
+    ) -PassThru
+    $script:FirefoxPid = $proc.Id
     $deadline = (Get-Date).AddSeconds(45)
     while ((Get-Date) -lt $deadline) {
         if (Test-Port) { break }
         Start-Sleep -Milliseconds 800
     }
     if (-not (Test-Port)) { throw "BiDi nao voltou apos reiniciar o Firefox (porta $Port)." }
-    Start-Sleep -Seconds 8   # deixa o WhatsApp Web comecar a carregar (Wait-Ready cuida do resto)
+    Start-Sleep -Seconds 8
 }
 
 function Receive-WS([int]$Timeout = 30) {
@@ -746,7 +764,7 @@ Write-Host "============================================" -ForegroundColor Cyan
 $seen         = @{}    # persiste entre reconexoes -> retoma de onde parou
 $chatClasses  = @{}    # persiste entre reconexoes -> classe (5 estados) por chat visitado
 $sidebarEndedByList = $false   # true so quando a sidebar terminou por fim-de-lista real (nao MaxChats/erro)
-$maxReconnect = 8    # o WS do Firefox cai a cada ~90s; cada queda custa 1 reinicio+retomada. Margem p/ varrer a lista toda.
+$maxReconnect = 3    # audio e best-effort; 3 tentativas sao suficientes (8 causava muitas janelas)
 $reconnects   = 0
 $completed    = $false
 

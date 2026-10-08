@@ -45,6 +45,7 @@ $script:ws = $null
 $script:context = $null
 $script:nextId = 1
 $script:sessionCreated = $false
+$script:FirefoxPid = $null   # PID do Firefox que abrimos; null se ja estava no ar
 
 function Log([string]$Text, [ConsoleColor]$Color = "Gray") {
     Write-Host "[$((Get-Date).ToString('HH:mm:ss'))] $Text" -ForegroundColor $Color
@@ -80,10 +81,31 @@ function Wait-Port([int]$Seconds = 40) {
 
 function Restart-Firefox {
     Log "Reiniciando Firefox/BiDi..." Yellow
-    Stop-Process -Name firefox -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    $args = "-no-remote -profile `"$FirefoxProfile`" --remote-debugging-port=$Port https://web.whatsapp.com/"
-    Start-Process -FilePath $FirefoxPath -ArgumentList $args
+    # Matar APENAS o Firefox que o SecondBrain abriu (nao todos os processos firefox).
+    # Sem PID rastreado, descobre pelo dono da porta BiDi.
+    $pidToKill = $script:FirefoxPid
+    if (-not $pidToKill) {
+        try {
+            $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($conn) { $pidToKill = [int]$conn.OwningProcess }
+        } catch {}
+    }
+    if ($pidToKill) {
+        # Tenta fechar de forma graciosa primeiro (flush do IndexedDB); forca se necessario.
+        try { Stop-Process -Id $pidToKill -ErrorAction SilentlyContinue } catch {}
+        $exited = (Wait-Process -Id $pidToKill -Timeout 4 -ErrorAction SilentlyContinue) -ne $null -or
+                  -not (Get-Process -Id $pidToKill -ErrorAction SilentlyContinue)
+        if (-not $exited) {
+            try { Stop-Process -Id $pidToKill -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        Start-Sleep -Seconds 2
+    }
+    $script:FirefoxPid = $null
+    $proc = Start-Process -FilePath $FirefoxPath -ArgumentList @(
+        "-no-remote", "-profile", $FirefoxProfile,
+        "--remote-debugging-port=$Port", "https://web.whatsapp.com/"
+    ) -PassThru
+    $script:FirefoxPid = $proc.Id
     if (-not (Wait-Port 40)) { throw "Firefox nao abriu a porta $Port." }
 }
 
