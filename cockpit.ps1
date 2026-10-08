@@ -607,10 +607,10 @@ function Handle-RunNow($ctx) {
         }
     } catch {}
     $ps1 = Join-Path $Root "secondbrain-run.ps1"
-    $proc = Start-Process powershell -ArgumentList @(
-        "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-        "-File", "`"$ps1`""
-    ) -PassThru
+    $proc = Start-Process -FilePath "powershell.exe" `
+        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $ps1) `
+        -WindowStyle Hidden `
+        -PassThru
     Send-Json $ctx 202 @{ status = "started"; pid = $proc.Id }
 }
 

@@ -1114,7 +1114,12 @@ async function runNow() {
   try {
     const r = await fetch("/api/run-now", { method: "POST" });
     if (r.status === 409) { alert("Já há uma rodada em execução."); return; }
-    if (!r.ok) { alert("Erro ao iniciar rodada."); return; }
+    if (!r.ok) {
+      let detail = "";
+      try { const d = await r.json(); detail = d.error || ""; } catch {}
+      alert("Erro ao iniciar rodada." + (detail ? "\n\n" + detail : ""));
+      return;
+    }
     setTimeout(loadHealth, 1200);
   } catch { alert("Erro de rede."); }
 }
