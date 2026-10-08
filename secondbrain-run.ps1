@@ -446,7 +446,11 @@ function Extract-JsonArray([string]$text) {
     # 1) array completo (primeiro '[' ate o ultimo ']')
     $end = $body.LastIndexOf(']')
     if ($end -gt 0) {
-        try { return Wrap-Parsed ($body.Substring(0, $end + 1) | ConvertFrom-Json) } catch {}
+        $candidate = $body.Substring(0, $end + 1)
+        # PS5: ConvertFrom-Json("[]") retorna $null; Wrap-Parsed devolve @(); mas `return @()`
+        # unrola no pipeline -> caller ve $null e confunde com falha real. ,@() evita o unroll.
+        if ($candidate -match '^\s*\[\s*\]\s*$') { return ,@() }
+        try { return Wrap-Parsed ($candidate | ConvertFrom-Json) } catch {}
     }
 
     # 2) reparo p/ resposta truncada (Joule/Copilot as vezes cortam saidas
