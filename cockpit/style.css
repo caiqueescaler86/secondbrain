@@ -492,3 +492,145 @@ html, body {
 }
 .agent-send:hover { box-shadow: 0 0 0 3px rgba(56,225,214,0.08); }
 .agent-send:disabled { opacity: .5; cursor: default; }
+
+/* ---------------- painel de saude / rodada ---------------- */
+#health-toggle {
+  background: var(--panel); border: 1px solid var(--line-hot); color: var(--accent);
+  border-radius: 8px; height: 34px; padding: 0 12px; font-size: 12px; cursor: pointer;
+  font-family: var(--mono); white-space: nowrap; transition: border-color .2s, box-shadow .2s;
+}
+#health-toggle:hover { box-shadow: 0 0 0 3px rgba(56,225,214,0.08); }
+
+.health-panel {
+  position: fixed; top: 0; left: 0; z-index: 120;
+  width: min(440px, 96vw); height: 100vh;
+  display: flex; flex-direction: column;
+  background: linear-gradient(180deg, var(--panel-2), var(--bg-2));
+  border-right: 1px solid var(--line-hot);
+  box-shadow: 18px 0 50px rgba(0,0,0,0.55);
+  animation: health-slide .22s ease both;
+}
+.health-panel[hidden] { display: none; }
+@keyframes health-slide { from { transform: translateX(-30px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+.health-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; border-bottom: 1px solid var(--line);
+}
+.health-title { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 13px; color: var(--hi); letter-spacing: .5px; }
+.health-glyph { font-size: 15px; }
+.health-head-btns { display: flex; gap: 4px; margin-left: auto; }
+.health-icon { background: none; border: none; color: var(--txt-dim); font-size: 14px; cursor: pointer; padding: 4px 6px; border-radius: 6px; transition: transform .3s, color .15s, background .15s; }
+.health-icon:hover { color: var(--txt); background: rgba(255,255,255,0.04); }
+#health-close:hover { color: var(--red); }
+#health-refresh.spin { transform: rotate(360deg); }
+
+.health-body { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 16px; }
+
+.health-sec { display: flex; flex-direction: column; gap: 10px; }
+.health-sec-head { display: flex; align-items: center; gap: 8px; }
+.health-sec-t {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 1.5px;
+  text-transform: uppercase; color: var(--txt-dim);
+}
+.health-count { color: var(--txt-mute); font-family: var(--mono); font-size: 11px; }
+.health-empty { color: var(--txt-mute); font-size: 12px; padding: 6px 2px; }
+
+/* badge de status da rodada */
+.run-badge {
+  font-family: var(--mono); font-size: 9px; letter-spacing: .5px;
+  padding: 2px 8px; border-radius: 20px; text-transform: uppercase;
+  border: 1px solid var(--line); color: var(--txt-dim);
+}
+.run-badge.sm { font-size: 8px; padding: 1px 6px; }
+.run-badge.done    { color: var(--hi);    border-color: rgba(124,242,201,.5); background: rgba(124,242,201,.10); }
+.run-badge.failed,
+.run-badge.fail    { color: var(--red);   border-color: rgba(255,107,125,.5); background: rgba(255,107,125,.10); }
+.run-badge.running { color: var(--amber); border-color: rgba(243,201,105,.5); background: rgba(243,201,105,.10); animation: run-pulse 1.4s ease-in-out infinite; }
+.run-badge.pending { color: var(--txt-mute); }
+@keyframes run-pulse { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+
+.run-meta { display: flex; flex-wrap: wrap; gap: 8px 14px; font-family: var(--mono); font-size: 10.5px; color: var(--txt-mute); }
+.run-id   { color: var(--accent-2); }
+.run-step { color: var(--txt-dim); }
+
+/* chips por canal (rodada atual) */
+.ch-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.ch-chip {
+  background: var(--panel-2); border: 1px solid var(--line); border-left: 2px solid var(--txt-mute);
+  border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 3px;
+}
+.ch-line { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.ch-name  { font-size: 12px; color: var(--txt); font-weight: 600; }
+.ch-state { font-family: var(--mono); font-size: 9px; letter-spacing: .5px; text-transform: uppercase; }
+.ch-sub   { font-family: var(--mono); font-size: 10px; color: var(--txt-mute); }
+.ch-err   { font-size: 10.5px; color: var(--red); line-height: 1.4; word-break: break-word; }
+.ch-chip.ch-ok      { border-left-color: var(--hi); }
+.ch-chip.ch-ok      .ch-state { color: var(--hi); }
+.ch-chip.ch-fail    { border-left-color: var(--red); }
+.ch-chip.ch-fail    .ch-state { color: var(--red); }
+.ch-chip.ch-running { border-left-color: var(--amber); }
+.ch-chip.ch-running .ch-state { color: var(--amber); animation: run-pulse 1.4s ease-in-out infinite; }
+.ch-chip.ch-pending .ch-state { color: var(--txt-mute); }
+
+/* laya */
+.laya-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.laya-stat {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 6px; text-align: center; display: flex; flex-direction: column; gap: 3px;
+}
+.laya-val { font-family: var(--mono); font-size: 18px; color: var(--accent); }
+.laya-lbl { font-size: 8.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--txt-mute); line-height: 1.3; }
+
+/* historico de rodadas */
+.hist-list { display: flex; flex-direction: column; gap: 6px; }
+.hist-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+}
+.hist-top { display: flex; align-items: center; gap: 8px; }
+.hist-when { font-family: var(--mono); font-size: 10.5px; color: var(--txt-dim); }
+.hist-dots { display: flex; gap: 5px; }
+.hist-dot {
+  width: 18px; height: 18px; border-radius: 5px; display: inline-flex;
+  align-items: center; justify-content: center; font-family: var(--mono); font-size: 9px;
+  border: 1px solid var(--line); color: var(--txt-mute); cursor: default;
+}
+.hist-dot.hd-ok      { color: var(--hi);    border-color: rgba(124,242,201,.45); background: rgba(124,242,201,.08); }
+.hist-dot.hd-fail    { color: var(--red);   border-color: rgba(255,107,125,.45); background: rgba(255,107,125,.10); }
+.hist-dot.hd-running { color: var(--amber); border-color: rgba(243,201,105,.45); background: rgba(243,201,105,.08); }
+.hist-dot.hd-pending { color: var(--txt-mute); }
+
+/* fila de trabalho pesado */
+.heavy-list { display: flex; flex-direction: column; gap: 8px; }
+.heavy-item {
+  background: var(--panel-2); border: 1px solid var(--line); border-left: 2px solid var(--violet);
+  border-radius: 8px; padding: 9px 10px; display: flex; flex-direction: column; gap: 5px;
+}
+.heavy-top { display: flex; align-items: center; gap: 8px; }
+.heavy-kind {
+  font-family: var(--mono); font-size: 8.5px; letter-spacing: .5px; text-transform: uppercase;
+  padding: 2px 6px; border-radius: 20px; border: 1px solid var(--line-hot); color: var(--accent); flex: none;
+}
+.heavy-kind.hk-meeting  { color: var(--violet);   border-color: rgba(185,140,255,.45); background: rgba(185,140,255,.08); }
+.heavy-kind.hk-whatsapp { color: var(--accent-2); border-color: rgba(89,184,255,.4); background: rgba(89,184,255,.08); }
+.heavy-label { font-size: 12.5px; color: var(--txt); font-weight: 600; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; }
+.heavy-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-family: var(--mono); font-size: 10px; color: var(--txt-mute); }
+.heavy-size { color: var(--amber); }
+.heavy-reason { color: var(--txt-dim); }
+.heavy-btn {
+  align-self: flex-start; background: transparent; border: 1px solid var(--line);
+  color: var(--txt-mute); border-radius: 6px; padding: 4px 12px; font-family: var(--mono);
+  font-size: 10.5px; cursor: not-allowed; opacity: .6;
+}
+.run-action-bar {
+  display: flex; gap: 8px; padding: 4px 0 8px;
+}
+.run-action-btn {
+  background: transparent; border: 1px solid var(--line); color: var(--txt-dim);
+  border-radius: 6px; padding: 5px 12px; font-family: var(--mono); font-size: 10.5px;
+  cursor: pointer; transition: border-color .15s, color .15s;
+}
+.run-action-btn:hover:not(.disabled) { border-color: var(--line-hot); color: var(--txt); }
+.run-action-btn.disabled { opacity: .45; cursor: not-allowed; }
+.run-action-btn.skip-active { color: var(--amber); border-color: rgba(243,201,105,.5); }

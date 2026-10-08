@@ -22,6 +22,13 @@ $WebDir    = Join-Path $Root "cockpit"
 $Processed = Join-Path $Root "processed"
 $TasksFile = Join-Path $Processed "tasks.json"
 
+# Arquivos do painel de saude/rodada (produzidos por secondbrain-run.ps1 e outros
+# processos). Podem NAO existir ainda -> os handlers tratam ausencia sem quebrar.
+$RunStatusFile  = Join-Path $Processed "run-status.json"
+$RunHistoryFile = Join-Path $Processed "run-history.jsonl"
+$HeavyQueueFile = Join-Path $Processed "heavy-queue.json"
+$MeetingWatchFile = Join-Path $Processed "meeting-watch.json"
+
 if (-not (Test-Path $Processed)) { New-Item -ItemType Directory -Path $Processed -Force | Out-Null }
 
 # UTF-8 sem BOM: evita que ferramentas externas (json.load, etc.) tropecem
@@ -190,6 +197,161 @@ function Handle-GetTasks($ctx) {
     $tasks = Read-Tasks
     if (Rollover-Tasks $tasks) { Write-Tasks $tasks }
     Send-Json $ctx 200 @($tasks)
+}
+
+# --- Painel de saude / rodada (somente leitura) ------------------------------
+# Le arquivos produzidos pela rodada e por outros processos. Eles podem NAO
+# existir ainda -> devolve um default vazio, nunca quebra. Envia o JSON CRU do
+# arquivo (sem reserializar) para preservar exatamente a estrutura contratada.
+function Send-RawJson($ctx, [string]$path, [string]$fallback) {
+    $text = $fallback
+    try {
+        if (Test-Path $path) {
+            $raw = [System.IO.File]::ReadAllText($path, [Text.Encoding]::UTF8)
+            if (-not [string]::IsNullOrWhiteSpace($raw)) { $text = $raw }
+        }
+    }
+    catch {}
+    Send-Text $ctx 200 $text "application/json; charset=utf-8"
+}
+
+function Handle-RunStatus($ctx) {
+    # Regra de obsolescencia: run-status.json fica "running" ate o fim. Se o
+    # processo dono (pid) morreu (timeout da Tarefa Agendada, crash), o arquivo
+    # mente "rodando" pra sempre. Aqui detectamos o pid morto e marcamos "morta"
+    # em vez de mostrar rodada-zumbi. Deteccao por PROCESSO (nao por tempo): o
+    # passo Meetings roda longo sem atualizar status e nao pode virar falso morto.
+    $text = "{}"
+    try {
+        if (Test-Path $RunStatusFile) {
+            $raw = [System.IO.File]::ReadAllText($RunStatusFile, [Text.Encoding]::UTF8)
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                $text = $raw
+                try {
+                    $st = $raw | ConvertFrom-Json
+                    if ([string]$st.status -eq "running") {
+                        $alive = $false
+                        if ($st.PSObject.Properties['pid'] -and $st.pid) {
+                            $alive = [bool](Get-Process -Id ([int]$st.pid) -ErrorAction SilentlyContinue)
+                        } else {
+                            # rodada antiga sem pid: fallback por tempo (>90min = morta)
+                            try { $age = ((Get-Date) - [datetime]::Parse([string]$st.updatedAt)).TotalMinutes } catch { $age = 999 }
+                            $alive = ($age -lt 90)
+                        }
+                        if (-not $alive) {
+                            $st | Add-Member -NotePropertyName status     -NotePropertyValue "morta" -Force
+                            $st | Add-Member -NotePropertyName deadReason -NotePropertyValue "processo encerrado (timeout/crash) em '$([string]$st.currentStep)'" -Force
+                            $text = ($st | ConvertTo-Json -Depth 8)
+                        }
+                    }
+                } catch {}
+            }
+        }
+    } catch {}
+    # Acrescenta flag de skip pendente (cockpit pode pedir pra pular a proxima rodada).
+    try {
+        $skipFlag = Join-Path $Processed "skip-next-run.flag"
+        $st2 = $text | ConvertFrom-Json
+        $st2 | Add-Member -NotePropertyName skipPending -NotePropertyValue ([bool](Test-Path $skipFlag)) -Force
+        $text = ($st2 | ConvertTo-Json -Depth 8)
+    } catch {}
+    Send-Text $ctx 200 $text "application/json; charset=utf-8"
+}
+function Handle-HeavyQueue($ctx) { Send-RawJson $ctx $HeavyQueueFile '{"items":[]}' }
+
+function Handle-MeetingWatch($ctx) {
+    # Vigia de reunioes: meeting-watch.json diz running=true enquanto o daemon
+    # vive. Se o pid morreu (crash, reboot sem autostart), o arquivo mente. Aqui
+    # detectamos o pid morto e marcamos running=false pra nao mostrar vigia-zumbi.
+    $text = '{"running":false}'
+    try {
+        if (Test-Path $MeetingWatchFile) {
+            $raw = [System.IO.File]::ReadAllText($MeetingWatchFile, [Text.Encoding]::UTF8)
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                $text = $raw
+                try {
+                    $mw = $raw | ConvertFrom-Json
+                    if ($mw.running -eq $true -and $mw.PSObject.Properties['pid'] -and $mw.pid) {
+                        $alive = [bool](Get-Process -Id ([int]$mw.pid) -ErrorAction SilentlyContinue)
+                        if (-not $alive) {
+                            $mw | Add-Member -NotePropertyName running    -NotePropertyValue $false -Force
+                            $mw | Add-Member -NotePropertyName deadReason -NotePropertyValue "processo encerrado (crash ou reboot sem autostart)" -Force
+                            $text = ($mw | ConvertTo-Json -Depth 8)
+                        }
+                    }
+                } catch {}
+            }
+        }
+    } catch {}
+    Send-Text $ctx 200 $text "application/json; charset=utf-8"
+}
+
+# Conexao TCP com timeout curto: porta aberta responde em ~ms; porta fechada
+# so espera o timeout. Usado pra checar servicos locais sem overhead de HTTP.
+function Test-TcpPort([string]$TargetHost, [int]$Port, [int]$Ms = 350) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($TargetHost, $Port, $null, $null)
+        if ($iar.AsyncWaitHandle.WaitOne($Ms, $false) -and $client.Connected) {
+            $client.EndConnect($iar); return $true
+        }
+        return $false
+    } catch { return $false } finally { try { $client.Close() } catch {} }
+}
+
+# Painel de dependencias: status ao vivo de tudo que o SecondBrain precisa.
+# Probes cockpit-side (TCP + processo), sem tocar em voz/joule/copilot/whatsapp.
+function Handle-Deps($ctx) {
+    $deps = @()
+
+    $deps += [ordered]@{ key = "llama"; label = "LLM local (llama :19001)"; ok = (Test-TcpPort "127.0.0.1" 19001); detail = "extracao de tarefas / analise" }
+    $deps += [ordered]@{ key = "teams"; label = "Teams: transcricao nativa (CDP :9225)"; ok = (Test-TcpPort "127.0.0.1" 9225); detail = "nomes em tempo real, sem esperar o Copilot" }
+
+    # Gravacao local da reuniao (whisper.cpp): a garantia 100% local (audio do
+    # sistema + mic), backup do Teams nativo. Checa o binario + o modelo.
+    $whisperBin = $null
+    foreach ($wp in @("$Root\whisper\Release\whisper-cli.exe", "$Root\whisper\whisper-cli.exe", "C:\whisper\Release\whisper-cli.exe", "C:\whisper\whisper-cli.exe", "C:\whisper\bin\whisper-cli.exe")) {
+        if (Test-Path $wp) { $whisperBin = $wp; break }
+    }
+    $modelOk = (Test-Path "$Root\whisper\models\ggml-medium.bin") -or (Test-Path "C:\whisper\models\ggml-medium.bin") -or (Test-Path "C:\whisper\ggml-medium.bin")
+    $wdetail = if (-not $whisperBin) { "whisper-cli.exe nao encontrado (rode setup-whisper)" } elseif (-not $modelOk) { "binario ok, modelo ggml-medium ausente" } else { "grava 100% local (backup do Teams nativo)" }
+    $deps += [ordered]@{ key = "record"; label = "Gravacao local (whisper)"; ok = ([bool]$whisperBin -and $modelOk); warn = ([bool]$whisperBin -and -not $modelOk); detail = $wdetail }
+
+    # Apps CDP (Joule / Copilot / WhatsApp) nas portas 9222-9224.
+    $cdpUp = 0; foreach ($p in 9222, 9223, 9224) { if (Test-TcpPort "127.0.0.1" $p 250) { $cdpUp++ } }
+    $deps += [ordered]@{ key = "cdp"; label = "Apps CDP (Joule/Copilot/WhatsApp)"; ok = ($cdpUp -gt 0); warn = ($cdpUp -lt 3); detail = "$cdpUp de 3 portas ativas" }
+
+    # Voz: conta so os processos RAIZ do voice_listen.py. O listener sobe 2
+    # processos python (principal + filho worker/bandeja); contar os dois daria
+    # falso "gatilho duplo". Instancia real = voice cujo PAI nao e outro voice.
+    $vn = 0
+    try {
+        $vprocs = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -match 'voice_listen\.py' })
+        $vids = @($vprocs | ForEach-Object { [int]$_.ProcessId })
+        $vn = @($vprocs | Where-Object { $vids -notcontains [int]$_.ParentProcessId }).Count
+    } catch {}
+    $vdetail = if ($vn -eq 0) { "parada" } elseif ($vn -eq 1) { "Ctrl+Shift+B - hey secondbrain" } else { "$vn instancias (risco de gatilho duplo)" }
+    $deps += [ordered]@{ key = "voice"; label = "Voz (atalho + wake word)"; ok = ($vn -ge 1); warn = ($vn -gt 1); detail = $vdetail }
+
+    $obj = [ordered]@{ updatedAt = (Get-Date).ToString("o"); deps = $deps }
+    Send-Text $ctx 200 ($obj | ConvertTo-Json -Depth 6) "application/json; charset=utf-8"
+}
+
+
+function Handle-RunHistory($ctx) {
+    # JSONL: uma rodada finalizada por linha. Devolve as ultimas ~20 como array.
+    if (-not (Test-Path $RunHistoryFile)) { Send-Text $ctx 200 "[]" "application/json; charset=utf-8"; return }
+    try {
+        $lines = @(Get-Content $RunHistoryFile -Encoding UTF8 -ErrorAction Stop |
+                   Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($lines.Count -eq 0) { Send-Text $ctx 200 "[]" "application/json; charset=utf-8"; return }
+        if ($lines.Count -gt 20) { $lines = $lines[($lines.Count - 20)..($lines.Count - 1)] }
+        $json = "[" + ($lines -join ",") + "]"
+        Send-Text $ctx 200 $json "application/json; charset=utf-8"
+    }
+    catch {
+        Send-Text $ctx 200 "[]" "application/json; charset=utf-8"
+    }
 }
 
 # --- cerebro compartilhado: cria uma tarefa a partir de campos ja estruturados.
@@ -433,6 +595,36 @@ function Handle-JoulePoll($ctx, [string]$id) {
     }
 }
 
+function Handle-RunNow($ctx) {
+    # Bloqueia se ja ha rodada viva (PID ativo no run-status.json).
+    try {
+        if (Test-Path $RunStatusFile) {
+            $rs = [System.IO.File]::ReadAllText($RunStatusFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ([string]$rs.status -eq "running" -and $rs.pid) {
+                $alive = [bool](Get-Process -Id ([int]$rs.pid) -ErrorAction SilentlyContinue)
+                if ($alive) { Send-Json $ctx 409 @{ error = "rodada em execucao (PID $($rs.pid))" }; return }
+            }
+        }
+    } catch {}
+    $ps1 = Join-Path $Root "secondbrain-run.ps1"
+    $proc = Start-Process powershell -ArgumentList @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+        "-File", "`"$ps1`""
+    ) -PassThru
+    Send-Json $ctx 202 @{ status = "started"; pid = $proc.Id }
+}
+
+function Handle-ToggleSkip($ctx) {
+    $skipFlag = Join-Path $Processed "skip-next-run.flag"
+    if (Test-Path $skipFlag) {
+        Remove-Item $skipFlag -Force -ErrorAction SilentlyContinue
+        Send-Json $ctx 200 @{ skipPending = $false }
+    } else {
+        [System.IO.File]::WriteAllText($skipFlag, (Get-Date).ToString("o"), $script:Utf8NoBom)
+        Send-Json $ctx 200 @{ skipPending = $true }
+    }
+}
+
 # --- servidor ----------------------------------------------------------------
 $prefix = "http://127.0.0.1:$Port/"
 $listener = New-Object System.Net.HttpListener
@@ -476,8 +668,29 @@ try {
             if ($method -eq "GET" -and $path -eq "/api/tasks") {
                 Handle-GetTasks $ctx
             }
+            elseif ($method -eq "GET" -and $path -eq "/api/run-status") {
+                Handle-RunStatus $ctx
+            }
+            elseif ($method -eq "GET" -and $path -eq "/api/run-history") {
+                Handle-RunHistory $ctx
+            }
+            elseif ($method -eq "GET" -and $path -eq "/api/heavy-queue") {
+                Handle-HeavyQueue $ctx
+            }
+            elseif ($method -eq "GET" -and $path -eq "/api/meeting-watch") {
+                Handle-MeetingWatch $ctx
+            }
+            elseif ($method -eq "GET" -and $path -eq "/api/deps") {
+                Handle-Deps $ctx
+            }
             elseif ($method -eq "POST" -and $path -eq "/api/task") {
                 Handle-CreateTask $ctx
+            }
+            elseif ($method -eq "POST" -and $path -eq "/api/run-now") {
+                Handle-RunNow $ctx
+            }
+            elseif ($method -eq "POST" -and $path -eq "/api/skip-next-run") {
+                Handle-ToggleSkip $ctx
             }
             elseif ($method -eq "POST" -and $path -eq "/api/joule") {
                 Handle-JouleAsk $ctx

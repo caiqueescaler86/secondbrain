@@ -347,7 +347,10 @@ function renderCard(task) {
   quick.setAttribute("aria-label", quick.title);
   quick.addEventListener("click", e => { e.stopPropagation(); if (!task.done) celebrate(e.clientX, e.clientY); patch(task.sbid, { done: !task.done }); });
   top.appendChild(quick);
-  top.appendChild(el("span", "badge st-" + (task.status || "x"), PREFIX[task.status] || task.status || "•"));
+  // Sanitiza status para display: pega só a 1ª palavra válida (LLM pode concatenar).
+  const STATUS_VALID = new Set(STATUS_KEYS);
+  const statusDisplay = (task.status || "").split(/\s+/).find(w => STATUS_VALID.has(w)) || task.status || "fazer";
+  top.appendChild(el("span", "badge st-" + statusDisplay, PREFIX[statusDisplay] || statusDisplay || "•"));
   if (task.prioridade) top.appendChild(el("span", "badge " + task.prioridade, task.prioridade));
   // Badge "novo": card criado hoje e ainda nao aberto pelo usuario.
   // "hoje": criado hoje mas ja reconhecido/mexido -> marcador persistente do dia.
@@ -380,7 +383,10 @@ function renderCard(task) {
   const di = dueInfo(task);
   if (di.label) meta.appendChild(el("span", "due " + di.cls, di.label));
   const srcs = el("div", "sources");
-  for (const s of (task.fontes || [])) srcs.appendChild(el("span", "src", s));
+  // dedup defensivo: LLM ocasionalmente concatena fontes ("whatsapp whatsapp")
+  const fontesRaw = (task.fontes || []).map(s => String(s).split(/\s+/)).flat().filter(Boolean);
+  const fontes = [...new Set(fontesRaw)];
+  for (const s of fontes) srcs.appendChild(el("span", "src", s));
   meta.appendChild(srcs);
   card.appendChild(meta);
 
@@ -981,6 +987,304 @@ function applyDuplicatesFilter() {
   scrollAgentLog();
 }
 
+// ---------- painel de saude / rodada (ao vivo) ----------
+// Somente leitura: consome /api/run-status, /api/run-history e /api/heavy-queue.
+// Todos podem devolver vazio (arquivos ainda nao existem) -> nunca quebra.
+let HEALTH = { open: false, poll: null };
+
+const CH_ORDER = ["joule", "copilot", "whatsapp", "meetings"];
+const CH_LABELS = { joule: "Joule", copilot: "Copilot", whatsapp: "WhatsApp", meetings: "Reuniões" };
+
+function chStatusInfo(st) {
+  switch ((st || "pending").toLowerCase()) {
+    case "ok":      return { cls: "ok",      txt: "OK" };
+    case "fail":    return { cls: "fail",    txt: "FALHOU" };
+    case "running": return { cls: "running", txt: "rodando" };
+    default:        return { cls: "pending", txt: "—" };
+  }
+}
+
+function fmtClock(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return d.toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+function fmtMs(ms) {
+  if (typeof ms !== "number") return "";
+  return ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms";
+}
+function fmtChars(n) {
+  if (typeof n !== "number") return "";
+  if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k car.";
+  return n + " car.";
+}
+
+async function loadHealth() {
+  const btn = $("#health-refresh");
+  if (btn) btn.classList.add("spin");
+  let status = {}, history = [], heavy = { items: [] }, watch = { running: false }, deps = { deps: [] };
+  try {
+    const [rs, rh, hq, mw, dp] = await Promise.all([
+      fetch("/api/run-status",  { cache: "no-store" }).then(r => r.json()).catch(() => ({})),
+      fetch("/api/run-history", { cache: "no-store" }).then(r => r.json()).catch(() => []),
+      fetch("/api/heavy-queue", { cache: "no-store" }).then(r => r.json()).catch(() => ({ items: [] })),
+      fetch("/api/meeting-watch", { cache: "no-store" }).then(r => r.json()).catch(() => ({ running: false })),
+      fetch("/api/deps", { cache: "no-store" }).then(r => r.json()).catch(() => ({ deps: [] })),
+    ]);
+    status  = rs || {};
+    history = Array.isArray(rh) ? rh : [];
+    heavy   = hq || { items: [] };
+    watch   = mw || { running: false };
+    deps    = dp || { deps: [] };
+  } catch (e) {
+    console.error(e);
+  } finally {
+    if (btn) setTimeout(() => btn.classList.remove("spin"), 400);
+  }
+  renderHealth(status, history, heavy, watch, deps);
+}
+
+function renderChannelChip(key, c) {
+  c = c || {};
+  const info = chStatusInfo(c.status);
+  const chip = el("div", "ch-chip ch-" + info.cls);
+  const line = el("div", "ch-line");
+  line.appendChild(el("span", "ch-name", CH_LABELS[key] || key));
+  line.appendChild(el("span", "ch-state", info.txt));
+  chip.appendChild(line);
+  const bits = [];
+  if (typeof c.items === "number") bits.push(c.items + (c.items === 1 ? " item" : " itens"));
+  if (typeof c.ms === "number") bits.push(fmtMs(c.ms));
+  if (bits.length) chip.appendChild(el("div", "ch-sub", bits.join(" · ")));
+  if (c.error) chip.appendChild(el("div", "ch-err", "⚠ " + c.error));
+  return chip;
+}
+
+function layaStat(val, label) {
+  const s = el("div", "laya-stat");
+  s.appendChild(el("span", "laya-val", (val == null ? "—" : String(val))));
+  s.appendChild(el("span", "laya-lbl", label));
+  return s;
+}
+
+function renderHistRow(run) {
+  run = run || {};
+  const row = el("div", "hist-row");
+  const top = el("div", "hist-top");
+  const st = (run.status || "").toLowerCase();
+  top.appendChild(el("span", "hist-when", fmtClock(run.startedAt || run.updatedAt)));
+  top.appendChild(el("span", "run-badge sm " + (st || "pending"), st || "—"));
+  row.appendChild(top);
+  const dots = el("div", "hist-dots");
+  const channels = run.channels || {};
+  for (const key of CH_ORDER) {
+    const c = channels[key] || {};
+    const info = chStatusInfo(c.status);
+    const d = el("span", "hist-dot hd-" + info.cls, (CH_LABELS[key] || key).slice(0, 1));
+    d.title = (CH_LABELS[key] || key) + ": " + info.txt +
+      (typeof c.items === "number" ? " (" + c.items + ")" : "") +
+      (c.error ? " — " + c.error : "");
+    dots.appendChild(d);
+  }
+  row.appendChild(dots);
+  return row;
+}
+
+function renderHeavyItem(it) {
+  it = it || {};
+  const row = el("div", "heavy-item");
+  const top = el("div", "heavy-top");
+  top.appendChild(el("span", "heavy-kind hk-" + (it.kind || ""), it.kind || "?"));
+  top.appendChild(el("span", "heavy-label", it.label || it.id || "(sem rótulo)"));
+  row.appendChild(top);
+  const meta = el("div", "heavy-meta");
+  if (typeof it.sizeChars === "number") meta.appendChild(el("span", "heavy-size", fmtChars(it.sizeChars)));
+  if (it.reason) meta.appendChild(el("span", "heavy-reason", it.reason));
+  if (it.addedAt) meta.appendChild(el("span", "heavy-when", fmtClock(it.addedAt)));
+  row.appendChild(meta);
+  const btn = el("button", "heavy-btn", "processar");
+  btn.disabled = true;
+  btn.title = "Em breve — o processamento manual ainda não está disponível";
+  row.appendChild(btn);
+  return row;
+}
+
+async function runNow() {
+  try {
+    const r = await fetch("/api/run-now", { method: "POST" });
+    if (r.status === 409) { alert("Já há uma rodada em execução."); return; }
+    if (!r.ok) { alert("Erro ao iniciar rodada."); return; }
+    setTimeout(loadHealth, 1200);
+  } catch { alert("Erro de rede."); }
+}
+
+async function toggleSkip() {
+  try {
+    const r = await fetch("/api/skip-next-run", { method: "POST" });
+    if (!r.ok) { alert("Erro."); return; }
+    loadHealth();
+  } catch { alert("Erro de rede."); }
+}
+
+function healthSection(title, countLabel) {
+  const sec = el("section", "health-sec");
+  const head = el("div", "health-sec-head");
+  head.appendChild(el("span", "health-sec-t", title));
+  if (countLabel != null) head.appendChild(el("span", "health-count", String(countLabel)));
+  sec.appendChild(head);
+  return { sec, head };
+}
+
+function renderHealth(status, history, heavy, watch, deps) {
+  const body = $("#health-body");
+  if (!body) return;
+  body.innerHTML = "";
+
+  // ----- dependencias / servicos -----
+  {
+    const list = (deps && Array.isArray(deps.deps)) ? deps.deps : [];
+    const okN = list.filter(d => d && d.ok && !d.warn).length;
+    const s = healthSection("Dependências", list.length ? (okN + "/" + list.length) : null);
+    if (!list.length) {
+      s.sec.appendChild(el("div", "health-empty", "Sem status de dependências."));
+    } else {
+      const grid = el("div", "ch-grid");
+      for (const d of list) {
+        const cls = d.ok ? (d.warn ? "running" : "ok") : "fail";
+        const chip = el("div", "ch-chip ch-" + cls);
+        const line = el("div", "ch-line");
+        line.appendChild(el("span", "ch-name", d.label || d.key));
+        line.appendChild(el("span", "ch-state", d.ok ? (d.warn ? "atenção" : "ativo") : "off"));
+        chip.appendChild(line);
+        if (d.detail) chip.appendChild(el("div", "ch-sub", d.detail));
+        grid.appendChild(chip);
+      }
+      s.sec.appendChild(grid);
+    }
+    body.appendChild(s.sec);
+  }
+
+  // ----- rodada atual -----
+  const hasRun = !!(status && status.runId);
+  const runStatus = (status && status.status || "").toLowerCase();
+  const cur = healthSection("Rodada atual");
+  if (hasRun) cur.head.appendChild(el("span", "run-badge " + (runStatus || "pending"), runStatus || "—"));
+  if (!hasRun) {
+    cur.sec.appendChild(el("div", "health-empty", "Nenhuma rodada registrada ainda."));
+  } else {
+    const meta = el("div", "run-meta");
+    meta.appendChild(el("span", "run-id", "#" + status.runId));
+    if (status.currentStep) meta.appendChild(el("span", "run-step", "passo: " + status.currentStep));
+    const upd = status.updatedAt || status.startedAt;
+    if (upd) meta.appendChild(el("span", "run-when", "atual. " + fmtClock(upd)));
+    cur.sec.appendChild(meta);
+
+    const grid = el("div", "ch-grid");
+    const channels = status.channels || {};
+    for (const key of CH_ORDER) grid.appendChild(renderChannelChip(key, channels[key]));
+    cur.sec.appendChild(grid);
+  }
+  body.appendChild(cur.sec);
+
+  // ----- barra de acoes de rodada -----
+  {
+    const isRunning = runStatus === "running";
+    const skipPending = !!(status && status.skipPending);
+    const bar = el("div", "run-action-bar");
+    const btnRun = document.createElement("button");
+    btnRun.className = "run-action-btn" + (isRunning ? " disabled" : "");
+    btnRun.textContent = isRunning ? "▶ em execução…" : "▶ rodar agora";
+    btnRun.disabled = isRunning;
+    if (!isRunning) btnRun.addEventListener("click", runNow);
+    const btnSkip = document.createElement("button");
+    btnSkip.className = "run-action-btn" + (skipPending ? " skip-active" : "");
+    btnSkip.textContent = skipPending ? "⊘ pular ativo  ×" : "⊘ pular próxima";
+    btnSkip.addEventListener("click", toggleSkip);
+    bar.appendChild(btnRun);
+    bar.appendChild(btnSkip);
+    body.appendChild(bar);
+  }
+
+  // ----- laya -----
+  const laya = status && status.laya;
+  if (laya) {
+    const s = healthSection("Laya (filtro)");
+    s.head.appendChild(el("span", "run-badge " + (laya.available ? "done" : "pending"), laya.available ? "ativo" : "off"));
+    if (laya.available) {
+      const g = el("div", "laya-grid");
+      g.appendChild(layaStat(laya.filteredChats, "chats filtrados"));
+      g.appendChild(layaStat(laya.filteredChunks, "chunks filtrados"));
+      g.appendChild(layaStat(laya.qwenInputSavedPct != null ? laya.qwenInputSavedPct + "%" : "—", "input Qwen evitado"));
+      s.sec.appendChild(g);
+    } else {
+      s.sec.appendChild(el("div", "health-empty", "Filtro Laya indisponível nesta rodada."));
+    }
+    body.appendChild(s.sec);
+  }
+
+  // ----- vigia de reunioes (daemon meeting-watch) -----
+  {
+    const w = watch || { running: false };
+    const s = healthSection("Vigia de reuniões");
+    const on = w.running === true;
+    s.head.appendChild(el("span", "run-badge " + (on ? "done" : "fail"), on ? "ativo" : "parado"));
+    if (!on) {
+      s.sec.appendChild(el("div", "health-empty", w.deadReason ? ("Vigia parado — " + w.deadReason) : "Vigia de reuniões não está rodando."));
+    } else {
+      const STATE_TXT = { idle: "aguardando reunião", gravando: "gravando (whisper)", harvest: "gravando + coletando transcrição nativa" };
+      const meta = el("div", "run-meta");
+      meta.appendChild(el("span", "run-step", STATE_TXT[w.state] || w.state || "—"));
+      if (w.teamsCdp) meta.appendChild(el("span", "run-when", "Teams nativo: ligado"));
+      if (w.state === "harvest" && typeof w.harvestCount === "number") meta.appendChild(el("span", "run-when", w.harvestCount + " falas coletadas"));
+      if (w.updatedAt) meta.appendChild(el("span", "run-when", "atual. " + fmtClock(w.updatedAt)));
+      s.sec.appendChild(meta);
+      if (w.lastMeeting && w.lastMeeting.label) {
+        const src = w.lastMeeting.source === "teams-native" ? "transcrição nativa" : "whisper";
+        const sub = el("div", "ch-sub", "última: " + w.lastMeeting.label + " · " + src + (w.lastMeeting.at ? " · " + fmtClock(w.lastMeeting.at) : ""));
+        s.sec.appendChild(sub);
+      }
+    }
+    body.appendChild(s.sec);
+  }
+
+  // ----- ultimas rodadas -----
+  const hs = healthSection("Últimas rodadas", history.length);
+  if (!history.length) {
+    hs.sec.appendChild(el("div", "health-empty", "Sem histórico de rodadas."));
+  } else {
+    const list = el("div", "hist-list");
+    for (const run of history.slice().reverse()) list.appendChild(renderHistRow(run));
+    hs.sec.appendChild(list);
+  }
+  body.appendChild(hs.sec);
+
+  // ----- fila de trabalho pesado -----
+  const items = (heavy && heavy.items) || [];
+  const hq = healthSection("Fila de trabalho pesado", items.length);
+  if (!items.length) {
+    hq.sec.appendChild(el("div", "health-empty", "Nada pesado na fila. 👍"));
+  } else {
+    const list = el("div", "heavy-list");
+    for (const it of items) list.appendChild(renderHeavyItem(it));
+    hq.sec.appendChild(list);
+  }
+  body.appendChild(hq.sec);
+}
+
+function openHealth() {
+  HEALTH.open = true;
+  $("#health-panel").hidden = false;
+  loadHealth();
+  if (HEALTH.poll) clearInterval(HEALTH.poll);
+  HEALTH.poll = setInterval(() => { if (HEALTH.open) loadHealth(); }, 5000);
+}
+function closeHealth() {
+  HEALTH.open = false;
+  $("#health-panel").hidden = true;
+  if (HEALTH.poll) { clearInterval(HEALTH.poll); HEALTH.poll = null; }
+}
+
 // ---------- wire up ----------
 $("#search").addEventListener("input", e => { STATE.search = e.target.value.trim(); render(); });
 $("#show-done").addEventListener("change", e => { STATE.showDone = e.target.checked; render(); });
@@ -1027,7 +1331,13 @@ document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
   if (!$("#modal-backdrop").hidden) closeModal();
   else if (AGENT.open) closeAgent();
+  else if (HEALTH.open) closeHealth();
 });
+
+// painel de saude / rodada
+$("#health-toggle").addEventListener("click", () => HEALTH.open ? closeHealth() : openHealth());
+$("#health-close").addEventListener("click", closeHealth);
+$("#health-refresh").addEventListener("click", loadHealth);
 
 // agente
 $("#agent-toggle").addEventListener("click", () => AGENT.open ? closeAgent() : openAgent());

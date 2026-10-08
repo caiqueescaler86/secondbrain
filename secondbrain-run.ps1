@@ -520,6 +520,22 @@ function Invoke-JsonWithRetry([scriptblock]$Block, [int]$Tries = 2, [int]$WaitSe
 # outros. Tetos (Joule 14d, Copilot 14d, WhatsApp 14d) evitam sobrecarga.
 # ============================================================
 
+# --- Skip flag: cockpit pode pedir pra pular esta rodada -------------------------
+$SkipFlagFile = Join-Path $Processed "skip-next-run.flag"
+if (Test-Path $SkipFlagFile) {
+    Remove-Item $SkipFlagFile -Force -ErrorAction SilentlyContinue
+    Log "Rodada $ts PULADA por solicitacao do cockpit." Yellow
+    $skipStatus = [ordered]@{
+        version = 1; runId = $ts; startedAt = (Get-Date).ToString("o")
+        updatedAt = (Get-Date).ToString("o"); status = "skipped"
+        currentStep = "fim"; pid = $PID; channels = @{}
+    }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $Processed "run-status.json"),
+        ($skipStatus | ConvertTo-Json -Depth 5), $Utf8NoBom)
+    exit 0
+}
+
 # Le o last-run.json uma vez aqui (o marco por canal precisa estar disponivel
 # ANTES das chamadas). O $lastSuccessRun global segue sendo relido mais abaixo
 # pro snapshot incremental.
